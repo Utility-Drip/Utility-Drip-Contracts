@@ -254,3 +254,76 @@ fn test_heartbeat_functionality() {
     // Should no longer be offline
     assert_eq!(client.is_meter_offline(&meter_id), false);
 }
+
+#[test]
+fn test_carbon_credit_payment() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    
+    // Setup default token
+    let default_token_admin = Address::generate(&env);
+    let default_token_address = env.register_stellar_asset_contract(default_token_admin.clone());
+    
+    // Setup Carbon Credit Token (e.g., AQUA/Eco-Token)
+    let eco_token_admin = Address::generate(&env);
+    let eco_token_address = env.register_stellar_asset_contract(eco_token_admin.clone());
+    let eco_token = token::Client::new(&env, &eco_token_address);
+    let eco_token_admin_client = token::StellarAssetClient::new(&env, &eco_token_address);
+
+    // Initial funding of Carbon Credits
+    eco_token_admin_client.mint(&user, &2000); // 2000 Eco-Tokens
+
+    // 1. Register Meter with default token
+    let rate = 10;
+    let meter_id = client.register_meter(&user, &provider, &rate, &default_token_address);
+
+    // 2. Add Carbon Credit token as supported
+    client.add_supported_token(&eco_token_address);
+
+    // 3. Top up using Carbon Credits
+    client.top_up_with_token(&meter_id, &1000, &eco_token_address);
+
+    // 4. Verify the meter balance increased
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert_eq!(meter.balance, 1000);
+    assert_eq!(meter.is_active, true);
+
+    // 5. Verify the Carbon Credits were BURNED (balance should be 1000 remaining)
+    assert_eq!(eco_token.balance(&user), 1000);
+    
+    // The contract itself should have 0 eco_tokens because they were correctly burned
+    assert_eq!(eco_token.balance(&contract_id), 0);
+}
+
+#[test]
+#[should_panic]
+fn test_unsupported_token_payment() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    
+    let default_token_admin = Address::generate(&env);
+    let default_token_address = env.register_stellar_asset_contract(default_token_admin.clone());
+    
+    let bad_token_admin = Address::generate(&env);
+    let bad_token_address = env.register_stellar_asset_contract(bad_token_admin.clone());
+    let bad_token_admin_client = token::StellarAssetClient::new(&env, &bad_token_address);
+    bad_token_admin_client.mint(&user, &2000);
+
+    let rate = 10;
+    let meter_id = client.register_meter(&user, &provider, &rate, &default_token_address);
+
+    // Should panic because bad_token_address is not supported
+    client.top_up_with_token(&meter_id, &1000, &bad_token_address);
+}

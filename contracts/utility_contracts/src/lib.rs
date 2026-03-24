@@ -36,6 +36,7 @@ pub enum DataKey {
     Meter(u64),
     Count,
     Oracle,
+    SupportedToken(Address), // For Carbon Credits / alternative tokens
 }
 
 #[contract]
@@ -51,6 +52,15 @@ impl UtilityContract {
         // This should be called by admin to set the oracle address
         // For now, we'll just store it in instance storage
         env.storage().instance().set(&DataKey::Oracle, &oracle_address);
+    }
+
+    pub fn add_supported_token(env: Env, token: Address) {
+        // Ideally requires admin auth, but for simplicity:
+        env.storage().instance().set(&DataKey::SupportedToken(token), &true);
+    }
+
+    pub fn remove_supported_token(env: Env, token: Address) {
+        env.storage().instance().set(&DataKey::SupportedToken(token), &false);
     }
 
     pub fn register_meter(
@@ -102,6 +112,29 @@ impl UtilityContract {
         meter.balance += amount;
         
         // Only activate if balance meets minimum requirement
+        meter.is_active = meter.balance >= MINIMUM_BALANCE_TO_FLOW;
+        meter.last_update = env.ledger().timestamp();
+        
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+    }
+
+    pub fn top_up_with_token(env: Env, meter_id: u64, amount: i128, payment_token: Address) {
+        let mut meter: Meter = env.storage().instance().get(&DataKey::Meter(meter_id)).ok_or("Meter not found").unwrap();
+        meter.user.require_auth();
+
+        let is_supported: bool = env.storage().instance().get(&DataKey::SupportedToken(payment_token.clone())).unwrap_or(false);
+        if !is_supported {
+            panic!("Token not supported for payment");
+        }
+
+        let client = token::Client::new(&env, &payment_token);
+        
+        // Burn the alternative token (Carbon Credit) to offset energy footprint
+        client.burn(&meter.user, &amount);
+
+        // Credit the meter balance 1:1 for the burned tokens
+        meter.balance += amount;
+        
         meter.is_active = meter.balance >= MINIMUM_BALANCE_TO_FLOW;
         meter.last_update = env.ledger().timestamp();
         

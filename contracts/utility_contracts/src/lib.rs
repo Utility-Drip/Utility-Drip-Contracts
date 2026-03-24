@@ -2,7 +2,8 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    Address, Env,
+    Address, Env, BytesN, Vec,
+    Address, Env, Symbol,
 };
 
 mod fuzz_tests;
@@ -12,6 +13,17 @@ mod fuzz_tests;
 pub enum BillingType {
     PrePaid,
     PostPaid,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct SignedUsageData {
+    pub meter_id: u64,
+    pub timestamp: u64,
+    pub watt_hours_consumed: i128,
+    pub units_consumed: i128,
+    pub signature: BytesN<64>,
+    pub public_key: BytesN<32>,
 }
 
 #[contracttype]
@@ -30,7 +42,10 @@ pub struct Meter {
     pub user: Address,
     pub provider: Address,
     pub billing_type: BillingType,
+    pub off_peak_rate: i128,      // rate per second during off-peak hours
+    pub peak_rate: i128,          // rate per second during peak hours (1.5x off-peak)
     pub rate_per_second: i128,
+    pub rate_per_unit: i128,
     pub balance: i128,
     pub debt: i128,
     pub collateral_limit: i128,
@@ -42,6 +57,7 @@ pub struct Meter {
     pub last_claim_time: u64,
     pub claimed_this_hour: i128,
     pub heartbeat: u64,
+    pub device_public_key: BytesN<32>,
 }
 
 #[contracttype]
@@ -69,6 +85,9 @@ pub enum ContractError {
     InvalidUsageValue = 4,
     UsageExceedsLimit = 5,
     InvalidPrecisionFactor = 6,
+    InvalidSignature = 4,
+    PublicKeyMismatch = 5,
+    TimestampTooOld = 6,
 }
 
 #[contract]
@@ -79,6 +98,44 @@ const DAY_IN_SECONDS: u64 = 24 * HOUR_IN_SECONDS;
 const DAILY_WITHDRAWAL_PERCENT: i128 = 10;
 const MAX_USAGE_PER_UPDATE: i128 = 1_000_000_000_000i128; // 1 billion kWh max per update
 const MIN_PRECISION_FACTOR: i128 = 1;
+const MAX_TIMESTAMP_DELAY: u64 = 300; // 5 minutes
+
+fn verify_usage_signature(env: &Env, signed_data: &SignedUsageData, meter: &Meter) -> Result<(), ContractError> {
+    // Check if the provided public key matches the registered meter's public key
+    if signed_data.public_key != meter.device_public_key {
+        return Err(ContractError::PublicKeyMismatch);
+    }
+
+    // Check timestamp is not too old (prevent replay attacks)
+    let current_time = env.ledger().timestamp();
+    if current_time.saturating_sub(signed_data.timestamp) > MAX_TIMESTAMP_DELAY {
+        return Err(ContractError::TimestampTooOld);
+    }
+
+    // Create the message that was signed: meter_id || timestamp || watt_hours_consumed || units_consumed
+    let mut message = Vec::new(env);
+    message.push_back(&signed_data.meter_id);
+    message.push_back(&signed_data.timestamp);
+    message.push_back(&signed_data.watt_hours_consumed);
+    message.push_back(&signed_data.units_consumed);
+
+    // Verify the signature using Soroban's built-in signature verification
+    if env.crypto().ed25519_verify(
+        &signed_data.public_key,
+        &message.to_bytes(),
+        &signed_data.signature,
+    ) {
+        Ok(())
+    } else {
+        Err(ContractError::InvalidSignature)
+    }
+}
+
+// Peak hours: 18:00 - 21:00 UTC
+const PEAK_HOUR_START: u64 = 18 * HOUR_IN_SECONDS; // 64800 seconds
+const PEAK_HOUR_END: u64 = 21 * HOUR_IN_SECONDS;   // 75600 seconds
+const PEAK_RATE_MULTIPLIER: i128 = 3; // 1.5x => stored as 3 (divide by 2)
+const RATE_PRECISION: i128 = 2; // Precision for rate calculations
 
 fn get_meter_or_panic(env: &Env, meter_id: u64) -> Meter {
     match env
@@ -104,6 +161,19 @@ fn get_oracle_or_panic(env: &Env) -> Address {
 
 fn remaining_postpaid_collateral(meter: &Meter) -> i128 {
     meter.collateral_limit.saturating_sub(meter.debt).max(0)
+}
+
+fn is_peak_hour(timestamp: u64) -> bool {
+    let seconds_in_day = timestamp % DAY_IN_SECONDS;
+    seconds_in_day >= PEAK_HOUR_START && seconds_in_day < PEAK_HOUR_END
+}
+
+fn get_effective_rate(meter: &Meter, timestamp: u64) -> i128 {
+    if is_peak_hour(timestamp) {
+        meter.peak_rate
+    } else {
+        meter.off_peak_rate
+    }
 }
 
 fn provider_meter_value(meter: &Meter) -> i128 {
@@ -243,19 +313,22 @@ impl UtilityContract {
         env: Env,
         user: Address,
         provider: Address,
-        rate: i128,
+        off_peak_rate: i128,
         token: Address,
+        device_public_key: BytesN<32>,
     ) -> u64 {
-        Self::register_meter_with_mode(env, user, provider, rate, token, BillingType::PrePaid)
+        Self::register_meter_with_mode(env, user, provider, rate, token, BillingType::PrePaid, device_public_key)
+        Self::register_meter_with_mode(env, user, provider, off_peak_rate, token, BillingType::PrePaid)
     }
 
     pub fn register_meter_with_mode(
         env: Env,
         user: Address,
         provider: Address,
-        rate: i128,
+        off_peak_rate: i128,
         token: Address,
         billing_type: BillingType,
+        device_public_key: BytesN<32>,
     ) -> u64 {
         user.require_auth();
 
@@ -267,6 +340,8 @@ impl UtilityContract {
         count += 1;
 
         let now = env.ledger().timestamp();
+        let peak_rate = off_peak_rate.saturating_mul(PEAK_RATE_MULTIPLIER) / RATE_PRECISION;
+        
         let usage_data = UsageData {
             total_watt_hours: 0,
             current_cycle_watt_hours: 0,
@@ -279,7 +354,10 @@ impl UtilityContract {
             user,
             provider,
             billing_type,
+            off_peak_rate,
+            peak_rate,
             rate_per_second: rate,
+            rate_per_unit: rate,
             balance: 0,
             debt: 0,
             collateral_limit: 0,
@@ -287,10 +365,11 @@ impl UtilityContract {
             is_active: false,
             token,
             usage_data,
-            max_flow_rate_per_hour: rate.saturating_mul(HOUR_IN_SECONDS as i128),
+            max_flow_rate_per_hour: off_peak_rate.saturating_mul(HOUR_IN_SECONDS as i128),
             last_claim_time: now,
             claimed_this_hour: 0,
             heartbeat: now,
+            device_public_key,
         };
 
         env.storage().instance().set(&DataKey::Meter(count), &meter);
@@ -346,7 +425,8 @@ impl UtilityContract {
         reset_claim_window_if_needed(&mut meter, now);
 
         let elapsed = now.saturating_sub(meter.last_update);
-        let requested = (elapsed as i128).saturating_mul(meter.rate_per_second);
+        let effective_rate = get_effective_rate(&meter, now);
+        let requested = (elapsed as i128).saturating_mul(effective_rate);
         let claimable = requested
             .min(remaining_claim_capacity(&meter))
             .min(provider_meter_value(&meter));
@@ -371,16 +451,42 @@ impl UtilityContract {
         }
     }
 
-    pub fn deduct_units(env: Env, meter_id: u64, units_consumed: i128) {
+    pub fn update_device_public_key(env: Env, meter_id: u64, new_public_key: BytesN<32>) {
+        let mut meter = get_meter_or_panic(&env, meter_id);
+        meter.user.require_auth();
+        meter.device_public_key = new_public_key;
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+    }
+
+    pub fn deduct_units(env: Env, signed_data: SignedUsageData) {
         let oracle = get_oracle_or_panic(&env);
         oracle.require_auth();
 
-        let mut meter = get_meter_or_panic(&env, meter_id);
+        let mut meter = get_meter_or_panic(&env, signed_data.meter_id);
+        
+        // Verify the signature matches the registered device public key
+        verify_usage_signature(&env, &signed_data, &meter)
+            .unwrap_or_else(|e| panic_with_error!(&env, e));
+
         let now = env.ledger().timestamp();
         reset_claim_window_if_needed(&mut meter, now);
 
-        let requested = units_consumed.saturating_mul(meter.rate_per_second);
+        let requested = signed_data.units_consumed.saturating_mul(meter.rate_per_second);
+        let effective_rate = get_effective_rate(&meter, now);
+        let requested = units_consumed.saturating_mul(effective_rate);
         let claimable = requested
+        // Peak hour tariff logic from Issue #13
+        let current_hour = (now % 86400) / 3600;
+        let is_peak = current_hour >= 18 && current_hour < 22; // 6 PM to 10 PM UTC
+        let base_cost = units_consumed.saturating_mul(meter.rate_per_unit);
+        let cost = if is_peak {
+            base_cost.saturating_mul(15) / 10
+        } else {
+            base_cost
+        };
+
+        // Enforce max flow rate hourly cap and available funds
+        let claimable = cost
             .min(remaining_claim_capacity(&meter))
             .min(provider_meter_value(&meter));
 
@@ -389,14 +495,14 @@ impl UtilityContract {
         meter.last_update = now;
         refresh_activity(&mut meter);
 
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+        env.storage().instance().set(&DataKey::Meter(signed_data.meter_id), &meter);
 
         if was_active && !meter.is_active {
-            publish_inactive_event(&env, meter_id, now);
+            publish_inactive_event(&env, signed_data.meter_id, now);
         }
 
         env.events()
-            .publish((symbol_short!("Usage"), meter_id), (units_consumed, claimable));
+            .publish((symbol_short!("Usage"), signed_data.meter_id), (signed_data.units_consumed, claimable));
     }
 
     pub fn set_max_flow_rate(env: Env, meter_id: u64, max_flow_rate_per_hour: i128) {
@@ -477,7 +583,8 @@ impl UtilityContract {
             .instance()
             .get::<DataKey, Meter>(&DataKey::Meter(meter_id))
             .map(|meter| {
-                if meter.rate_per_second <= 0 {
+                if meter.off_peak_rate <= 0 {
+                if meter.rate_per_unit <= 0 {
                     return 0;
                 }
 
@@ -486,7 +593,9 @@ impl UtilityContract {
                     return 0;
                 }
 
-                env.ledger().timestamp() + (available / meter.rate_per_second) as u64
+                env.ledger().timestamp() + (available / meter.off_peak_rate) as u64
+                env.ledger().timestamp()
+                    + (available / meter.rate_per_unit) as u64
             })
     }
 
@@ -515,6 +624,10 @@ impl UtilityContract {
             }
             None => true,
         }
+    }
+
+    pub fn get_watt_hours_display(watt_hours: i128, precision_factor: i128) -> i128 {
+        watt_hours / precision_factor
     }
 }
 

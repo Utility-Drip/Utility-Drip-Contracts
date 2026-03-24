@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    Address, Env,
+    Address, Env, BytesN, Vec,
 };
 
 #[contracttype]
@@ -10,6 +10,17 @@ use soroban_sdk::{
 pub enum BillingType {
     PrePaid,
     PostPaid,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct SignedUsageData {
+    pub meter_id: u64,
+    pub timestamp: u64,
+    pub watt_hours_consumed: i128,
+    pub units_consumed: i128,
+    pub signature: BytesN<64>,
+    pub public_key: BytesN<32>,
 }
 
 #[contracttype]
@@ -40,6 +51,7 @@ pub struct Meter {
     pub last_claim_time: u64,
     pub claimed_this_hour: i128,
     pub heartbeat: u64,
+    pub device_public_key: BytesN<32>,
 }
 
 #[contracttype]
@@ -64,6 +76,9 @@ pub enum ContractError {
     MeterNotFound = 1,
     OracleNotSet = 2,
     WithdrawalLimitExceeded = 3,
+    InvalidSignature = 4,
+    PublicKeyMismatch = 5,
+    TimestampTooOld = 6,
 }
 
 #[contract]
@@ -72,6 +87,38 @@ pub struct UtilityContract;
 const HOUR_IN_SECONDS: u64 = 60 * 60;
 const DAY_IN_SECONDS: u64 = 24 * HOUR_IN_SECONDS;
 const DAILY_WITHDRAWAL_PERCENT: i128 = 10;
+const MAX_TIMESTAMP_DELAY: u64 = 300; // 5 minutes
+
+fn verify_usage_signature(env: &Env, signed_data: &SignedUsageData, meter: &Meter) -> Result<(), ContractError> {
+    // Check if the provided public key matches the registered meter's public key
+    if signed_data.public_key != meter.device_public_key {
+        return Err(ContractError::PublicKeyMismatch);
+    }
+
+    // Check timestamp is not too old (prevent replay attacks)
+    let current_time = env.ledger().timestamp();
+    if current_time.saturating_sub(signed_data.timestamp) > MAX_TIMESTAMP_DELAY {
+        return Err(ContractError::TimestampTooOld);
+    }
+
+    // Create the message that was signed: meter_id || timestamp || watt_hours_consumed || units_consumed
+    let mut message = Vec::new(env);
+    message.push_back(&signed_data.meter_id);
+    message.push_back(&signed_data.timestamp);
+    message.push_back(&signed_data.watt_hours_consumed);
+    message.push_back(&signed_data.units_consumed);
+
+    // Verify the signature using Soroban's built-in signature verification
+    if env.crypto().ed25519_verify(
+        &signed_data.public_key,
+        &message.to_bytes(),
+        &signed_data.signature,
+    ) {
+        Ok(())
+    } else {
+        Err(ContractError::InvalidSignature)
+    }
+}
 
 fn get_meter_or_panic(env: &Env, meter_id: u64) -> Meter {
     match env
@@ -238,8 +285,9 @@ impl UtilityContract {
         provider: Address,
         rate: i128,
         token: Address,
+        device_public_key: BytesN<32>,
     ) -> u64 {
-        Self::register_meter_with_mode(env, user, provider, rate, token, BillingType::PrePaid)
+        Self::register_meter_with_mode(env, user, provider, rate, token, BillingType::PrePaid, device_public_key)
     }
 
     pub fn register_meter_with_mode(
@@ -249,6 +297,7 @@ impl UtilityContract {
         rate: i128,
         token: Address,
         billing_type: BillingType,
+        device_public_key: BytesN<32>,
     ) -> u64 {
         user.require_auth();
 
@@ -284,6 +333,7 @@ impl UtilityContract {
             last_claim_time: now,
             claimed_this_hour: 0,
             heartbeat: now,
+            device_public_key,
         };
 
         env.storage().instance().set(&DataKey::Meter(count), &meter);
@@ -364,15 +414,27 @@ impl UtilityContract {
         }
     }
 
-    pub fn deduct_units(env: Env, meter_id: u64, units_consumed: i128) {
+    pub fn update_device_public_key(env: Env, meter_id: u64, new_public_key: BytesN<32>) {
+        let mut meter = get_meter_or_panic(&env, meter_id);
+        meter.user.require_auth();
+        meter.device_public_key = new_public_key;
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+    }
+
+    pub fn deduct_units(env: Env, signed_data: SignedUsageData) {
         let oracle = get_oracle_or_panic(&env);
         oracle.require_auth();
 
-        let mut meter = get_meter_or_panic(&env, meter_id);
+        let mut meter = get_meter_or_panic(&env, signed_data.meter_id);
+        
+        // Verify the signature matches the registered device public key
+        verify_usage_signature(&env, &signed_data, &meter)
+            .unwrap_or_else(|e| panic_with_error!(&env, e));
+
         let now = env.ledger().timestamp();
         reset_claim_window_if_needed(&mut meter, now);
 
-        let requested = units_consumed.saturating_mul(meter.rate_per_second);
+        let requested = signed_data.units_consumed.saturating_mul(meter.rate_per_second);
         let claimable = requested
             .min(remaining_claim_capacity(&meter))
             .min(provider_meter_value(&meter));
@@ -382,14 +444,14 @@ impl UtilityContract {
         meter.last_update = now;
         refresh_activity(&mut meter);
 
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+        env.storage().instance().set(&DataKey::Meter(signed_data.meter_id), &meter);
 
         if was_active && !meter.is_active {
-            publish_inactive_event(&env, meter_id, now);
+            publish_inactive_event(&env, signed_data.meter_id, now);
         }
 
         env.events()
-            .publish((symbol_short!("Usage"), meter_id), (units_consumed, claimable));
+            .publish((symbol_short!("Usage"), signed_data.meter_id), (signed_data.units_consumed, claimable));
     }
 
     pub fn set_max_flow_rate(env: Env, meter_id: u64, max_flow_rate_per_hour: i128) {

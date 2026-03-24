@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contracttype, contractimpl, Address, Env, token, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol};
 
 #[contracttype]
 #[derive(Clone)]
@@ -84,7 +84,12 @@ impl UtilityContract {
     }
 
     pub fn top_up(env: Env, meter_id: u64, amount: i128) {
-        let mut meter: Meter = env.storage().instance().get(&DataKey::Meter(meter_id)).ok_or("Meter not found").unwrap();
+        let mut meter: Meter = env
+            .storage()
+            .instance()
+            .get(&DataKey::Meter(meter_id))
+            .ok_or("Meter not found")
+            .unwrap();
         meter.user.require_auth();
 
         let client = token::Client::new(&env, &meter.token);
@@ -93,18 +98,36 @@ impl UtilityContract {
         meter.balance += amount;
         meter.is_active = true;
         meter.last_update = env.ledger().timestamp();
-        
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Meter(meter_id), &meter);
     }
 
     pub fn deduct_units(env: Env, meter_id: u64, units_consumed: i128) {
-        let oracle: Address = env.storage().instance().get(&DataKey::Oracle).expect("Oracle address not set");
+        let oracle: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Oracle)
+            .expect("Oracle address not set");
         oracle.require_auth();
 
-        let mut meter: Meter = env.storage().instance().get(&DataKey::Meter(meter_id)).ok_or("Meter not found").unwrap();
-        
-        let cost = units_consumed * meter.rate_per_unit;
-        
+        let mut meter: Meter = env
+            .storage()
+            .instance()
+            .get(&DataKey::Meter(meter_id))
+            .ok_or("Meter not found")
+            .unwrap();
+
+        let current_hour = (env.ledger().timestamp() % 86400) / 3600;
+        let is_peak = current_hour >= 18 && current_hour < 22; // 6 PM to 10 PM UTC
+        let base_cost = units_consumed * meter.rate_per_unit;
+        let cost = if is_peak {
+            base_cost * 15 / 10
+        } else {
+            base_cost
+        };
+
         if cost > 0 {
             let actual_claim = if cost > meter.balance {
                 meter.balance
@@ -114,7 +137,11 @@ impl UtilityContract {
 
             if actual_claim > 0 {
                 let client = token::Client::new(&env, &meter.token);
-                client.transfer(&env.current_contract_address(), &meter.provider, &actual_claim);
+                client.transfer(
+                    &env.current_contract_address(),
+                    &meter.provider,
+                    &actual_claim,
+                );
                 meter.balance -= actual_claim;
             }
         }
@@ -124,46 +151,66 @@ impl UtilityContract {
             meter.is_active = false;
         }
 
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+        env.storage()
+            .instance()
+            .set(&DataKey::Meter(meter_id), &meter);
 
         // Emit UsageReported event
         env.events().publish(
             (Symbol::new(&env, "UsageReported"), meter_id),
-            (units_consumed, cost)
+            (units_consumed, cost),
         );
     }
 
     pub fn update_usage(env: Env, meter_id: u64, watt_hours_consumed: i128) {
-        let mut meter: Meter = env.storage().instance().get(&DataKey::Meter(meter_id)).ok_or("Meter not found").unwrap();
+        let mut meter: Meter = env
+            .storage()
+            .instance()
+            .get(&DataKey::Meter(meter_id))
+            .ok_or("Meter not found")
+            .unwrap();
         meter.user.require_auth();
 
         // Update usage data with high precision
         let precise_consumption = watt_hours_consumed * meter.usage_data.precision_factor;
         meter.usage_data.total_watt_hours += precise_consumption;
         meter.usage_data.current_cycle_watt_hours += precise_consumption;
-        
+
         // Update peak usage if current is higher
         if meter.usage_data.current_cycle_watt_hours > meter.usage_data.peak_usage_watt_hours {
             meter.usage_data.peak_usage_watt_hours = meter.usage_data.current_cycle_watt_hours;
         }
-        
+
         meter.usage_data.last_reading_timestamp = env.ledger().timestamp();
-        
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Meter(meter_id), &meter);
     }
 
     pub fn reset_cycle_usage(env: Env, meter_id: u64) {
-        let mut meter: Meter = env.storage().instance().get(&DataKey::Meter(meter_id)).ok_or("Meter not found").unwrap();
+        let mut meter: Meter = env
+            .storage()
+            .instance()
+            .get(&DataKey::Meter(meter_id))
+            .ok_or("Meter not found")
+            .unwrap();
         meter.provider.require_auth();
-        
+
         meter.usage_data.current_cycle_watt_hours = 0;
         meter.usage_data.last_reading_timestamp = env.ledger().timestamp();
-        
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Meter(meter_id), &meter);
     }
 
     pub fn get_usage_data(env: Env, meter_id: u64) -> Option<UsageData> {
-        if let Some(meter) = env.storage().instance().get::<DataKey, Meter>(&DataKey::Meter(meter_id)) {
+        if let Some(meter) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Meter>(&DataKey::Meter(meter_id))
+        {
             Some(meter.usage_data)
         } else {
             None
@@ -176,41 +223,65 @@ impl UtilityContract {
 
     pub fn get_watt_hours_display(precise_watt_hours: i128, precision_factor: i128) -> i128 {
         precise_watt_hours / precision_factor
+    }
+
     pub fn calculate_expected_depletion(env: Env, meter_id: u64) -> Option<u64> {
-        if let Some(meter) = env.storage().instance().get::<_, Meter>(&DataKey::Meter(meter_id)) {
-            if meter.balance <= 0 || meter.rate_per_second <= 0 {
+        if let Some(meter) = env
+            .storage()
+            .instance()
+            .get::<_, Meter>(&DataKey::Meter(meter_id))
+        {
+            if meter.balance <= 0 || meter.rate_per_unit <= 0 {
                 return Some(0); // Already depleted or no consumption
             }
-            
-            let seconds_until_depletion = meter.balance / meter.rate_per_second;
+
+            let units_until_depletion = meter.balance / meter.rate_per_unit;
             let current_time = env.ledger().timestamp();
-            Some(current_time + seconds_until_depletion as u64)
+            Some(current_time + units_until_depletion as u64)
         } else {
             None
         }
     }
 
     pub fn emergency_shutdown(env: Env, meter_id: u64) {
-        let mut meter: Meter = env.storage().instance().get(&DataKey::Meter(meter_id)).ok_or("Meter not found").unwrap();
+        let mut meter: Meter = env
+            .storage()
+            .instance()
+            .get(&DataKey::Meter(meter_id))
+            .ok_or("Meter not found")
+            .unwrap();
         meter.provider.require_auth();
-        
+
         // Immediately disable the meter
         meter.is_active = false;
-        
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Meter(meter_id), &meter);
     }
 
     pub fn update_heartbeat(env: Env, meter_id: u64) {
-        let mut meter: Meter = env.storage().instance().get(&DataKey::Meter(meter_id)).ok_or("Meter not found").unwrap();
+        let mut meter: Meter = env
+            .storage()
+            .instance()
+            .get(&DataKey::Meter(meter_id))
+            .ok_or("Meter not found")
+            .unwrap();
         meter.user.require_auth();
-        
+
         meter.heartbeat = env.ledger().timestamp();
-        
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Meter(meter_id), &meter);
     }
 
     pub fn is_meter_offline(env: Env, meter_id: u64) -> bool {
-        if let Some(meter) = env.storage().instance().get::<_, Meter>(&DataKey::Meter(meter_id)) {
+        if let Some(meter) = env
+            .storage()
+            .instance()
+            .get::<_, Meter>(&DataKey::Meter(meter_id))
+        {
             let current_time = env.ledger().timestamp();
             let time_since_heartbeat = current_time.checked_sub(meter.heartbeat).unwrap_or(0);
             // Consider offline if heartbeat is > 1 hour old (3600 seconds)

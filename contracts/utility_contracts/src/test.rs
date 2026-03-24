@@ -15,7 +15,7 @@ fn test_utility_flow() {
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
     let oracle = Address::generate(&env);
-    
+
     // Setup Oracle
     client.set_oracle(&oracle);
 
@@ -54,7 +54,7 @@ fn test_utility_flow() {
     // 3. Report usage (billing by units)
     let units_consumed = 15; // 15 kWh
     client.deduct_units(&meter_id, &units_consumed);
-    
+
     let meter = client.get_meter(&meter_id).unwrap();
     // 15 units * 10 tokens/unit = 150 tokens claimed
     assert_eq!(meter.balance, 350);
@@ -93,12 +93,15 @@ fn test_utility_flow() {
     assert_eq!(usage_data.peak_usage_watt_hours, 2000000); // Updated peak
 
     // 8. Test display helper function
-    let display_total = UtilityContract::get_watt_hours_display(usage_data.total_watt_hours, usage_data.precision_factor);
+    let display_total = UtilityContract::get_watt_hours_display(
+        usage_data.total_watt_hours,
+        usage_data.precision_factor,
+    );
     assert_eq!(display_total, 3500); // 3500000 / 1000 = 3500 (3.5 kWh)
 }
 
 #[test]
-fn test_max_flow_rate_cap() {
+fn test_peak_hour_tariff() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -107,33 +110,35 @@ fn test_max_flow_rate_cap() {
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
-    
+    let oracle = Address::generate(&env);
+    client.set_oracle(&oracle);
+
     // Setup a token
     let token_admin = Address::generate(&env);
     let token_address = env.register_stellar_asset_contract(token_admin.clone());
+    let token = token::Client::new(&env, &token_address);
     let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
 
     // Initial funding
-    token_admin_client.mint(&user, &10000);
+    token_admin_client.mint(&user, &1000);
 
-    // Register Meter with high rate
-    let rate = 100; // 100 tokens per second
+    // Register Meter
+    let rate = 10; // 10 tokens per unit
     let meter_id = client.register_meter(&user, &provider, &rate, &token_address);
-    
-    // Set a low max flow rate cap
-    client.set_max_flow_rate(&meter_id, &5000); // 5000 tokens per hour max
-    
-    // Top up with large balance
-    client.top_up(&meter_id, &10000);
-    
-    // Try to claim more than the hourly cap
-    env.ledger().set_timestamp(env.ledger().timestamp() + 120); // 2 minutes pass
-    client.claim(&meter_id);
-    
+    client.top_up(&meter_id, &500);
+
+    // Set time to 19:00:00 UTC (19 * 3600 = 68400)
+    // 19:00 falls exactly in the 18:00 - 22:00 peak hours bracket
+    env.ledger().set_timestamp(68400);
+
+    // Consume 10 units. Base cost = 100.
+    // 150% Peak multiplier means 150 tokens claimed.
+    let units_consumed = 10;
+    client.deduct_units(&meter_id, &units_consumed);
+
     let meter = client.get_meter(&meter_id).unwrap();
-    // Should be capped at 5000 tokens per hour
-    assert_eq!(meter.claimed_this_hour, 5000); // 120 seconds * 100 = 12000, but capped at 5000
-    assert_eq!(meter.balance, 5000); // Should have exactly 5000 remaining
+    assert_eq!(meter.balance, 350); // 500 - 150
+    assert_eq!(token.balance(&provider), 150);
 }
 
 #[test]
@@ -146,7 +151,7 @@ fn test_calculate_expected_depletion() {
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
-    
+
     // Setup a token
     let token_admin = Address::generate(&env);
     let token_address = env.register_stellar_asset_contract(token_admin.clone());
@@ -158,12 +163,12 @@ fn test_calculate_expected_depletion() {
     let rate = 10; // 10 tokens per second
     let meter_id = client.register_meter(&user, &provider, &rate, &token_address);
     client.top_up(&meter_id, &500);
-    
+
     // Calculate depletion time
     let depletion_time = client.calculate_expected_depletion(&meter_id).unwrap();
     let current_time = env.ledger().timestamp();
     let expected_depletion = current_time + 50; // 500 tokens / 10 tokens per second = 50 seconds
-    
+
     assert_eq!(depletion_time, expected_depletion);
 }
 
@@ -177,7 +182,7 @@ fn test_emergency_shutdown() {
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
-    
+
     // Setup a token
     let token_admin = Address::generate(&env);
     let token_address = env.register_stellar_asset_contract(token_admin.clone());
@@ -189,14 +194,14 @@ fn test_emergency_shutdown() {
     let rate = 10;
     let meter_id = client.register_meter(&user, &provider, &rate, &token_address);
     client.top_up(&meter_id, &500);
-    
+
     // Verify meter is active
     let meter = client.get_meter(&meter_id).unwrap();
     assert_eq!(meter.is_active, true);
-    
+
     // Emergency shutdown
     client.emergency_shutdown(&meter_id);
-    
+
     // Verify meter is inactive
     let meter = client.get_meter(&meter_id).unwrap();
     assert_eq!(meter.is_active, false);
@@ -212,7 +217,7 @@ fn test_heartbeat_functionality() {
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
-    
+
     // Setup a token
     let token_admin = Address::generate(&env);
     let token_address = env.register_stellar_asset_contract(token_admin.clone());
@@ -223,19 +228,19 @@ fn test_heartbeat_functionality() {
     // Register meter
     let rate = 10;
     let meter_id = client.register_meter(&user, &provider, &rate, &token_address);
-    
+
     // Initially should not be offline
     assert_eq!(client.is_meter_offline(&meter_id), false);
-    
+
     // Simulate time passing more than 1 hour
     env.ledger().set_timestamp(env.ledger().timestamp() + 3700); // > 1 hour
-    
+
     // Should now be offline
     assert_eq!(client.is_meter_offline(&meter_id), true);
-    
+
     // Update heartbeat
     client.update_heartbeat(&meter_id);
-    
+
     // Should no longer be offline
     assert_eq!(client.is_meter_offline(&meter_id), false);
 }

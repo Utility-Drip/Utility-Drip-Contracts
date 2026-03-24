@@ -107,6 +107,9 @@ fn test_max_flow_rate_cap() {
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
+    let oracle = Address::generate(&env);
+
+    client.set_oracle(&oracle);
     
     // Setup a token
     let token_admin = Address::generate(&env);
@@ -126,14 +129,13 @@ fn test_max_flow_rate_cap() {
     // Top up with large balance
     client.top_up(&meter_id, &10000);
     
-    // Try to claim more than the hourly cap
-    env.ledger().set_timestamp(env.ledger().timestamp() + 120); // 2 minutes pass
-    client.claim(&meter_id);
+    // Try to deduct more than the hourly cap (simulated via Oracle)
+    // 120 units at rate 100 should cost 12000, which exceeds 5000 cap
+    client.deduct_units(&meter_id, &120);
     
     let meter = client.get_meter(&meter_id).unwrap();
-    // Should be capped at 5000 tokens per hour
-    assert_eq!(meter.claimed_this_hour, 5000); // 120 seconds * 100 = 12000, but capped at 5000
-    assert_eq!(meter.balance, 5000); // Should have exactly 5000 remaining
+    assert_eq!(meter.claimed_this_hour, 5000);
+    assert_eq!(meter.balance, 5000);
 }
 
 #[test]

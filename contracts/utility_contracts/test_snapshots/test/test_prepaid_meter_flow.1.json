@@ -39,7 +39,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "i128": "1000"
+                  "i128": "10000"
                 }
               ]
             }
@@ -90,7 +90,7 @@
                   "u64": "1"
                 },
                 {
-                  "i128": "500"
+                  "i128": "5000"
                 }
               ]
             }
@@ -109,7 +109,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                     },
                     {
-                      "i128": "500"
+                      "i128": "5000"
                     }
                   ]
                 }
@@ -183,7 +183,7 @@
                   "u64": "1"
                 },
                 {
-                  "i128": "50"
+                  "i128": "475"
                 }
               ]
             }
@@ -378,7 +378,7 @@
                               "symbol": "claimed_this_hour"
                             },
                             "val": {
-                              "i128": "500"
+                              "i128": "5000"
                             }
                           },
                           {
@@ -539,6 +539,38 @@
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "ProviderWindow"
+                          },
+                          {
+                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "map": [
+                          {
+                            "key": {
+                              "symbol": "daily_withdrawn"
+                            },
+                            "val": {
+                              "i128": "100"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "last_reset"
+                            },
+                            "val": {
+                              "u64": "10"
+                            }
+                          }
+                        ]
                       }
                     }
                   ]
@@ -807,7 +839,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "500"
+                      "i128": "5000"
                     }
                   },
                   {
@@ -859,7 +891,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "500"
+                      "i128": "5000"
                     }
                   },
                   {

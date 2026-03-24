@@ -39,7 +39,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "i128": "1000"
+                  "i128": "5000"
                 }
               ]
             }
@@ -89,7 +89,7 @@
                   "u64": "1"
                 },
                 {
-                  "i128": "500"
+                  "i128": "5000"
                 }
               ]
             }
@@ -108,7 +108,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                     },
                     {
-                      "i128": "500"
+                      "i128": "5000"
                     }
                   ]
                 }
@@ -240,7 +240,7 @@
                               "symbol": "balance"
                             },
                             "val": {
-                              "i128": "350"
+                              "i128": "4850"
                             }
                           },
                           {
@@ -537,7 +537,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "350"
+                      "i128": "4850"
                     }
                   },
                   {
@@ -589,7 +589,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "500"
+                      "i128": "0"
                     }
                   },
                   {

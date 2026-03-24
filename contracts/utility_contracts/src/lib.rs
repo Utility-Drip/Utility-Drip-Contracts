@@ -28,6 +28,8 @@ pub struct Meter {
     pub user: Address,
     pub provider: Address,
     pub billing_type: BillingType,
+    pub off_peak_rate: i128,      // rate per second during off-peak hours
+    pub peak_rate: i128,          // rate per second during peak hours (1.5x off-peak)
     pub rate_per_second: i128,
     pub rate_per_unit: i128,
     pub balance: i128,
@@ -74,6 +76,12 @@ const HOUR_IN_SECONDS: u64 = 60 * 60;
 const DAY_IN_SECONDS: u64 = 24 * HOUR_IN_SECONDS;
 const DAILY_WITHDRAWAL_PERCENT: i128 = 10;
 
+// Peak hours: 18:00 - 21:00 UTC
+const PEAK_HOUR_START: u64 = 18 * HOUR_IN_SECONDS; // 64800 seconds
+const PEAK_HOUR_END: u64 = 21 * HOUR_IN_SECONDS;   // 75600 seconds
+const PEAK_RATE_MULTIPLIER: i128 = 3; // 1.5x => stored as 3 (divide by 2)
+const RATE_PRECISION: i128 = 2; // Precision for rate calculations
+
 fn get_meter_or_panic(env: &Env, meter_id: u64) -> Meter {
     match env
         .storage()
@@ -98,6 +106,19 @@ fn get_oracle_or_panic(env: &Env) -> Address {
 
 fn remaining_postpaid_collateral(meter: &Meter) -> i128 {
     meter.collateral_limit.saturating_sub(meter.debt).max(0)
+}
+
+fn is_peak_hour(timestamp: u64) -> bool {
+    let seconds_in_day = timestamp % DAY_IN_SECONDS;
+    seconds_in_day >= PEAK_HOUR_START && seconds_in_day < PEAK_HOUR_END
+}
+
+fn get_effective_rate(meter: &Meter, timestamp: u64) -> i128 {
+    if is_peak_hour(timestamp) {
+        meter.peak_rate
+    } else {
+        meter.off_peak_rate
+    }
 }
 
 fn provider_meter_value(meter: &Meter) -> i128 {
@@ -237,17 +258,17 @@ impl UtilityContract {
         env: Env,
         user: Address,
         provider: Address,
-        rate: i128,
+        off_peak_rate: i128,
         token: Address,
     ) -> u64 {
-        Self::register_meter_with_mode(env, user, provider, rate, token, BillingType::PrePaid)
+        Self::register_meter_with_mode(env, user, provider, off_peak_rate, token, BillingType::PrePaid)
     }
 
     pub fn register_meter_with_mode(
         env: Env,
         user: Address,
         provider: Address,
-        rate: i128,
+        off_peak_rate: i128,
         token: Address,
         billing_type: BillingType,
     ) -> u64 {
@@ -261,6 +282,8 @@ impl UtilityContract {
         count += 1;
 
         let now = env.ledger().timestamp();
+        let peak_rate = off_peak_rate.saturating_mul(PEAK_RATE_MULTIPLIER) / RATE_PRECISION;
+        
         let usage_data = UsageData {
             total_watt_hours: 0,
             current_cycle_watt_hours: 0,
@@ -273,6 +296,8 @@ impl UtilityContract {
             user,
             provider,
             billing_type,
+            off_peak_rate,
+            peak_rate,
             rate_per_second: rate,
             rate_per_unit: rate,
             balance: 0,
@@ -282,7 +307,7 @@ impl UtilityContract {
             is_active: false,
             token,
             usage_data,
-            max_flow_rate_per_hour: rate.saturating_mul(HOUR_IN_SECONDS as i128),
+            max_flow_rate_per_hour: off_peak_rate.saturating_mul(HOUR_IN_SECONDS as i128),
             last_claim_time: now,
             claimed_this_hour: 0,
             heartbeat: now,
@@ -341,7 +366,8 @@ impl UtilityContract {
         reset_claim_window_if_needed(&mut meter, now);
 
         let elapsed = now.saturating_sub(meter.last_update);
-        let requested = (elapsed as i128).saturating_mul(meter.rate_per_second);
+        let effective_rate = get_effective_rate(&meter, now);
+        let requested = (elapsed as i128).saturating_mul(effective_rate);
         let claimable = requested
             .min(remaining_claim_capacity(&meter))
             .min(provider_meter_value(&meter));
@@ -374,6 +400,9 @@ impl UtilityContract {
         let now = env.ledger().timestamp();
         reset_claim_window_if_needed(&mut meter, now);
 
+        let effective_rate = get_effective_rate(&meter, now);
+        let requested = units_consumed.saturating_mul(effective_rate);
+        let claimable = requested
         // Peak hour tariff logic from Issue #13
         let current_hour = (now % 86400) / 3600;
         let is_peak = current_hour >= 18 && current_hour < 22; // 6 PM to 10 PM UTC
@@ -466,6 +495,7 @@ impl UtilityContract {
             .instance()
             .get::<DataKey, Meter>(&DataKey::Meter(meter_id))
             .map(|meter| {
+                if meter.off_peak_rate <= 0 {
                 if meter.rate_per_unit <= 0 {
                     return 0;
                 }
@@ -475,6 +505,7 @@ impl UtilityContract {
                     return 0;
                 }
 
+                env.ledger().timestamp() + (available / meter.off_peak_rate) as u64
                 env.ledger().timestamp()
                     + (available / meter.rate_per_unit) as u64
             })

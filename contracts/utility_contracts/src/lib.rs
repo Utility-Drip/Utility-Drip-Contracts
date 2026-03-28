@@ -70,6 +70,8 @@ pub struct UsageData {
     pub precision_factor: i128,
     pub renewable_watt_hours: i128,
     pub renewable_percentage: i128,
+    pub monthly_volume: i128,
+    pub last_volume_reset: u64,
 }
 
 mod gas_estimator;
@@ -103,6 +105,10 @@ pub struct Meter {
     pub is_paused: bool,
     pub tier_threshold: i128,
     pub tier_rate: i128,
+    pub is_disputed: bool,
+    pub challenge_timestamp: u64,
+    pub credit_drip_rate: i128,
+    pub is_closed: bool,
 }
 
 #[contracttype]
@@ -132,6 +138,33 @@ pub struct BatchCreatedEvent {
 }
 
 #[contracttype]
+#[derive(Clone)]
+pub struct BillingGroup {
+    pub parent_account: Address,
+    pub child_meters: Vec<u64>,
+    pub created_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct WebhookConfig {
+    pub url: String,
+    pub user: Address,
+    pub is_active: bool,
+    pub created_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct LowBalanceAlert {
+    pub meter_id: u64,
+    pub user: Address,
+    pub remaining_balance: i128,
+    pub hours_remaining: f32,
+    pub timestamp: u64,
+}
+
+#[contracttype]
 pub enum DataKey {
     Meter(u64),
     ProviderWindow(Address),
@@ -146,6 +179,12 @@ pub enum DataKey {
     Referral(Address),
     PollVotes(Symbol),
     UserVoted(Address, Symbol),
+    BillingGroup(Address),
+    WebhookConfig(Address),
+    LastAlert(u64),
+    ClosingFeeBps,
+    Contributor(u64, Address),
+    AuthorizedContributor(u64, Address),
 }
 
 #[contracterror]
@@ -169,6 +208,13 @@ pub enum ContractError {
     MeterNotPaired = 15,
     MeterPaused = 16,
     AlreadyVoted = 17,
+    InvalidClosingFee = 18,
+    AccountAlreadyClosed = 19,
+    InsufficientBalance = 20,
+    UnauthorizedContributor = 21,
+    InDispute = 22,
+    ChallengeActive = 23,
+    NotAnOracle = 24,
 }
 
 #[contracttype]
@@ -363,13 +409,22 @@ fn is_peak_hour(timestamp: u64) -> bool {
 }
 
 fn get_effective_rate(meter: &Meter, timestamp: u64) -> i128 {
-    let base_rate = if meter.tier_threshold > 0
+    let mut base_rate = if meter.tier_threshold > 0
         && meter.usage_data.current_cycle_watt_hours > meter.tier_threshold
     {
         meter.tier_rate
     } else {
         meter.off_peak_rate
     };
+
+    // Task #89: Tiered Usage Discount Logic
+    // Rolling 30-day volume discount (e.g., > 1000 USDC volume gives 10% discount)
+    // For this implementation, we use monthly_volume tracked in UsageData
+    if meter.usage_data.monthly_volume > 100_000_000 { // example threshold: 1,000,000 (1000.00 in USDC with 2 decimals)
+        base_rate = base_rate.saturating_mul(90) / 100; // 10% discount
+    } else if meter.usage_data.monthly_volume > 50_000_000 {
+        base_rate = base_rate.saturating_mul(95) / 100; // 5% discount
+    }
 
     if is_peak_hour(timestamp) {
         base_rate.saturating_mul(PEAK_RATE_MULTIPLIER) / RATE_PRECISION
@@ -675,6 +730,8 @@ impl UtilityContract {
             precision_factor: 1000,
             renewable_watt_hours: 0,
             renewable_percentage: 0,
+            monthly_volume: 0,
+            last_volume_reset: now,
         };
 
         let meter = Meter {
@@ -685,7 +742,7 @@ impl UtilityContract {
             peak_rate,
             rate_per_second: off_peak_rate,
             rate_per_unit: off_peak_rate,
-            green_energy_discount_bps: DEFAULT_GREEN_ENERGY_DISCOUNT_BPS,
+            green_energy_discount_bps: 0,
             balance: 0,
             debt: 0,
             collateral_limit: 0,
@@ -703,6 +760,10 @@ impl UtilityContract {
             is_paused: false,
             tier_threshold: 100_000, // 100 kWh default threshold
             tier_rate: off_peak_rate.saturating_mul(120) / 100, // 20% higher rate for top tier by default
+            is_disputed: false,
+            challenge_timestamp: 0,
+            credit_drip_rate: 0,
+            is_closed: false,
         };
 
         env.storage().instance().set(&DataKey::Meter(count), &meter);
@@ -754,6 +815,10 @@ impl UtilityContract {
                 peak_usage_watt_hours: 0,
                 last_reading_timestamp: now,
                 precision_factor: 1000,
+                renewable_watt_hours: 0,
+                renewable_percentage: 0,
+                monthly_volume: 0,
+                last_volume_reset: now,
             };
 
             let meter = Meter {
@@ -764,6 +829,7 @@ impl UtilityContract {
                 peak_rate,
                 rate_per_second: meter_info.off_peak_rate,
                 rate_per_unit: meter_info.off_peak_rate,
+                green_energy_discount_bps: 0,
                 balance: 0,
                 debt: 0,
                 collateral_limit: 0,
@@ -783,6 +849,10 @@ impl UtilityContract {
                 is_paused: false,
                 tier_threshold: 100_000,
                 tier_rate: meter_info.off_peak_rate.saturating_mul(120) / 100,
+                is_disputed: false,
+                challenge_timestamp: 0,
+                credit_drip_rate: 0,
+                is_closed: false,
             };
 
             env.storage().instance().set(&DataKey::Meter(count), &meter);
@@ -824,15 +894,37 @@ impl UtilityContract {
         batch_event
     }
 
-    pub fn top_up(env: Env, meter_id: u64, amount: i128) {
+    pub fn top_up(env: Env, meter_id: u64, amount: i128, contributor: Address) {
         let mut meter = get_meter_or_panic(&env, meter_id);
-        meter.user.require_auth();
+        
+        // Authorization: either the primary user OR an authorized contributor
+        let is_authorized = if contributor == meter.user {
+            contributor.require_auth();
+            true
+        } else {
+            let auth_key = DataKey::AuthorizedContributor(meter_id, contributor.clone());
+            if env.storage().instance().get::<_, bool>(&auth_key).unwrap_or(false) {
+                contributor.require_auth();
+                true
+            } else {
+                false
+            }
+        };
+
+        if !is_authorized {
+            panic_with_error!(&env, ContractError::UnauthorizedContributor);
+        }
 
         let was_active = meter.is_active;
         let old_meter_value = provider_meter_value(&meter);
-        // Transfer tokens from user to contract
+        // Transfer tokens from contributor to contract
         let token_client = token::Client::new(&env, &meter.token);
-        token_client.transfer(&meter.user, &env.current_contract_address(), &amount);
+        token_client.transfer(&contributor, &env.current_contract_address(), &amount);
+
+        // Track individual contribution
+        let contribution_key = DataKey::Contributor(meter_id, contributor.clone());
+        let current_contribution = env.storage().instance().get::<_, i128>(&contribution_key).unwrap_or(0);
+        env.storage().instance().set(&contribution_key, &current_contribution.saturating_add(amount));
 
         // Convert XLM to USD cents if needed
         let converted_amount = match convert_xlm_to_usd_if_needed(&env, amount, &meter.token) {
@@ -961,6 +1053,11 @@ impl UtilityContract {
         // Verify the signature and pairing
         verify_usage_signature(&env, &signed_data, &meter)?;
 
+        // Task #88: Kill-Switch Check
+        if meter.is_disputed {
+            panic_with_error!(&env, ContractError::InDispute);
+        }
+
         // Store old meter value for pool update
         let old_meter_value = provider_meter_value(&meter);
 
@@ -1019,6 +1116,15 @@ impl UtilityContract {
 
         meter.last_update = now;
 
+        // Task #89: Update monthly volume
+        let now = env.ledger().timestamp();
+        if now.saturating_sub(meter.usage_data.last_volume_reset) >= (30 * DAY_IN_SECONDS) {
+            meter.usage_data.monthly_volume = cost;
+            meter.usage_data.last_volume_reset = now;
+        } else {
+            meter.usage_data.monthly_volume = meter.usage_data.monthly_volume.saturating_add(cost);
+        }
+
         // Update provider total pool
         let new_meter_value = provider_meter_value(&meter);
         update_provider_total_pool(&env, &meter.provider, old_meter_value, new_meter_value);
@@ -1035,20 +1141,23 @@ impl UtilityContract {
     }
 
     pub fn claim(env: Env, meter_id: u64) {
-        let mut meter: Meter = env
-            .storage()
-            .instance()
-            .get(&DataKey::Meter(meter_id))
-            .ok_or("Meter not found")
-            .unwrap();
+        let mut meter = get_meter_or_panic(&env, meter_id);
         meter.provider.require_auth();
+
+        // Task #88: Kill-Switch Check
+        if meter.is_disputed {
+            panic_with_error!(&env, ContractError::InDispute);
+        }
 
         // Store old meter value for pool update
         let old_meter_value = provider_meter_value(&meter);
 
         let now = env.ledger().timestamp();
         let elapsed = now.checked_sub(meter.last_update).unwrap_or(0);
-        let amount = (elapsed as i128) * meter.rate_per_unit;
+        
+        // Task #90: Credit Settlement Flow
+        // If there's a credit_drip_rate, add it to the normal consumption flow
+        let amount = (elapsed as i128).saturating_mul(meter.rate_per_unit.saturating_add(meter.credit_drip_rate));
 
         // Check if we're in the same hour as last claim
         let current_hour = now / 3600;
@@ -1099,6 +1208,12 @@ impl UtilityContract {
                 }
                 meter.balance -= claimable;
                 meter.claimed_this_hour += claimable;
+                
+                // If credit drip was active, reduce the debt if in PostPaid mode
+                if meter.billing_type == BillingType::PostPaid && meter.credit_drip_rate > 0 {
+                    let credit_settlement = (elapsed as i128).saturating_mul(meter.credit_drip_rate).min(meter.debt);
+                    meter.debt = meter.debt.saturating_sub(credit_settlement);
+                }
             }
         } else {
             // New hour, reset claimed_this_hour
@@ -1138,6 +1253,12 @@ impl UtilityContract {
                 }
                 meter.balance -= claimable;
                 meter.claimed_this_hour = claimable;
+
+                // If credit drip was active, reduce the debt if in PostPaid mode
+                if meter.billing_type == BillingType::PostPaid && meter.credit_drip_rate > 0 {
+                    let credit_settlement = (elapsed as i128).saturating_mul(meter.credit_drip_rate).min(meter.debt);
+                    meter.debt = meter.debt.saturating_sub(credit_settlement);
+                }
             }
         }
 
@@ -1925,12 +2046,19 @@ impl UtilityContract {
 
     // Enhanced claim function with webhook integration
     pub fn claim_with_alerts(env: Env, meter_id: u64) {
-        let mut meter: Meter = env.storage().instance().get(&DataKey::Meter(meter_id)).ok_or("Meter not found").unwrap();
+        let mut meter = get_meter_or_panic(&env, meter_id);
         meter.provider.require_auth();
+
+        // Task #88: Kill-Switch Check
+        if meter.is_disputed {
+            panic_with_error!(&env, ContractError::InDispute);
+        }
 
         let now = env.ledger().timestamp();
         let elapsed = now.checked_sub(meter.last_update).unwrap_or(0);
-        let amount = (elapsed as i128) * meter.rate_per_second;
+        
+        // Task #90: Credit Settlement Flow
+        let amount = (elapsed as i128).saturating_mul(meter.rate_per_unit.saturating_add(meter.credit_drip_rate));
         
         // Check if we need to reset the hourly counter
         let hours_passed = now.checked_sub(meter.last_claim_time).unwrap_or(0) / 3600;
@@ -1963,6 +2091,12 @@ impl UtilityContract {
             client.transfer(&env.current_contract_address(), &meter.provider, &final_claimable);
             meter.balance -= final_claimable;
             meter.claimed_this_hour += final_claimable;
+
+            // If credit drip was active, reduce the debt if in PostPaid mode
+            if meter.billing_type == BillingType::PostPaid && meter.credit_drip_rate > 0 {
+                let credit_settlement = (elapsed as i128).saturating_mul(meter.credit_drip_rate).min(meter.debt);
+                meter.debt = meter.debt.saturating_sub(credit_settlement);
+            }
         }
 
         meter.last_update = now;
@@ -1974,6 +2108,121 @@ impl UtilityContract {
 
         // Check for low balance and send alert if needed
         Self::check_and_send_low_balance_alert(&env, &meter, meter_id);
+    }
+
+    // Task #87: Roommates support
+    pub fn add_authorized_contributor(env: Env, meter_id: u64, contributor: Address) {
+        let meter = get_meter_or_panic(&env, meter_id);
+        meter.user.require_auth();
+        
+        env.storage().instance().set(&DataKey::AuthorizedContributor(meter_id, contributor), &true);
+    }
+
+    pub fn remove_authorized_contributor(env: Env, meter_id: u64, contributor: Address) {
+        let meter = get_meter_or_panic(&env, meter_id);
+        meter.user.require_auth();
+        
+        env.storage().instance().remove(&DataKey::AuthorizedContributor(meter_id, contributor));
+    }
+
+    pub fn get_contribution(env: Env, meter_id: u64, contributor: Address) -> i128 {
+        env.storage().instance().get(&DataKey::Contributor(meter_id, contributor)).unwrap_or(0)
+    }
+
+    // Task #88: Emergency Kill-Switch (Challenge)
+    pub fn challenge_service(env: Env, meter_id: u64) {
+        let mut meter = get_meter_or_panic(&env, meter_id);
+        meter.user.require_auth();
+        
+        if meter.is_disputed {
+            panic_with_error!(&env, ContractError::ChallengeActive);
+        }
+
+        meter.is_disputed = true;
+        meter.is_paused = true;
+        meter.challenge_timestamp = env.ledger().timestamp();
+        
+        let now = env.ledger().timestamp();
+        refresh_activity(&mut meter, now);
+        
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+        
+        env.events().publish((symbol_short!("Challeng"), meter_id), meter.challenge_timestamp);
+    }
+
+    pub fn resolve_challenge(env: Env, meter_id: u64, restored: bool) {
+        let mut meter = get_meter_or_panic(&env, meter_id);
+        
+        // This should be called by the Oracle or Admin
+        let oracle = get_oracle_or_panic(&env);
+        oracle.require_auth();
+        
+        if !meter.is_disputed {
+            return;
+        }
+
+        if restored {
+            // Service restored, unpause and resume stream
+            meter.is_disputed = false;
+            meter.is_paused = false;
+        } else {
+            // Service NOT restored
+            meter.is_disputed = false; // Resolved but failed
+            meter.is_paused = true; // Stay paused
+        }
+
+        let now = env.ledger().timestamp();
+        refresh_activity(&mut meter, now);
+        
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+        
+        env.events().publish((symbol_short!("Resolv"), meter_id), restored);
+    }
+
+    pub fn refund_disputed_funds(env: Env, meter_id: u64) {
+        let mut meter = get_meter_or_panic(&env, meter_id);
+        meter.user.require_auth();
+        
+        // Can only refund if challenged more than 48 hours ago and not resolved
+        let now = env.ledger().timestamp();
+        if !meter.is_disputed || now.saturating_sub(meter.challenge_timestamp) < (48 * HOUR_IN_SECONDS) {
+            panic_with_error!(&env, ContractError::ChallengeActive);
+        }
+
+        // Return funds to user
+        let refundable = match meter.billing_type {
+            BillingType::PrePaid => meter.balance,
+            BillingType::PostPaid => remaining_postpaid_collateral(&meter),
+        };
+
+        if refundable > 0 {
+            let withdrawal_amount = match convert_usd_to_xlm_if_needed(&env, refundable, &meter.token) {
+                Ok(amount) => amount,
+                Err(_) => panic_with_error!(&env, ContractError::PriceConversionFailed),
+            };
+            
+            let client = token::Client::new(&env, &meter.token);
+            client.transfer(&env.current_contract_address(), &meter.user, &withdrawal_amount);
+        }
+
+        meter.balance = 0;
+        meter.debt = 0;
+        meter.is_active = false;
+        meter.is_disputed = false;
+        
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+        
+        env.events().publish((symbol_short!("Refund"), meter_id), refundable);
+    }
+
+    // Task #90: Post-Paid Settlement Credit Logic
+    pub fn set_credit_drip(env: Env, meter_id: u64, drip_rate: i128) {
+        let mut meter = get_meter_or_panic(&env, meter_id);
+        meter.provider.require_auth();
+        
+        meter.credit_drip_rate = drip_rate;
+        
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
     }
 }
 

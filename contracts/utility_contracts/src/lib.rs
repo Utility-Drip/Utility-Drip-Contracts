@@ -1,5 +1,4 @@
 #![no_std]
-
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
@@ -20,6 +19,16 @@ pub trait PriceOracle {
 pub trait SoroSusu {
     fn get_susu_score(env: Env, user: Address) -> u32;
     fn is_trusted_saver(env: Env, user: Address) -> bool;
+}
+
+#[contractclient(name = "VestingVaultClient")]
+pub trait VestingVault {
+    fn get_staked_balance(env: Env, user: Address) -> i128;
+}
+
+#[contractclient(name = "NFTMinterClient")]
+pub trait NFTMinter {
+    fn mint_receipt_nft(env: Env, to: Address, meter_id: u64, cycle_index: u32);
 }
 
 #[contracttype]
@@ -285,6 +294,8 @@ pub enum DataKey {
     MaintenanceWallet,
     ProtocolFeeBps,
     SupportedToken(Address),
+    VestingVault,
+    NFTMinter,
     SupportedWithdrawalToken(Address),
     ProviderTotalPool(Address),
     ProviderTokenMeters(Address, Address),
@@ -296,6 +307,7 @@ pub enum DataKey {
     LastAlert(u64),
     Alert(u64, u64),
     ClosingFeeBps,
+    CycleIndex(u64),
     Contributor(u64, Address),
     AuthorizedContributor(u64, Address),
     // Task #2: Tax Compliance
@@ -629,6 +641,19 @@ fn convert_usd_to_token_if_needed(
     }
 }
 
+fn get_platform_fee_bps_impl(env: &Env, user: &Address) -> i128 {
+    let base_fee: i128 = env.storage().instance().get(&DataKey::ProtocolFeeBps).unwrap_or(0);
+    
+    // Issue #124: Loyalty-Based Staking Fee Reduction
+    if let Some(vault_address) = env.storage().instance().get::<DataKey, Address>(&DataKey::VestingVault) {
+        let vault_client = VestingVaultClient::new(env, &vault_address);
+        if vault_client.get_staked_balance(user.clone()) > 0 {
+            return base_fee / 2; // 50% discount for staked users
+        }
+    }
+    base_fee
+}
+
 fn remaining_postpaid_collateral(meter: &Meter) -> i128 {
     meter.collateral_limit.saturating_sub(meter.debt).max(0)
 }
@@ -672,7 +697,7 @@ fn provider_meter_value(meter: &Meter) -> i128 {
 }
 
 fn refresh_activity(meter: &mut Meter, now: u64) {
-    if meter.is_paused {
+    if meter.is_paused || meter.is_closed {
         meter.is_active = false;
         return;
     }
@@ -1218,6 +1243,14 @@ impl UtilityContract {
             .set(&DataKey::Oracle, &oracle_address);
     }
 
+    pub fn set_vesting_vault(env: Env, vault: Address) {
+        env.storage().instance().set(&DataKey::VestingVault, &vault);
+    }
+
+    pub fn set_nft_minter(env: Env, minter: Address) {
+        env.storage().instance().set(&DataKey::NFTMinter, &minter);
+    }
+
     pub fn set_maintenance_config(env: Env, wallet: Address, fee_bps: i128) {
         env.storage()
             .instance()
@@ -1748,6 +1781,20 @@ impl UtilityContract {
         // Task #89: Update monthly volume
         let now = env.ledger().timestamp();
         if now.saturating_sub(meter.usage_data.last_volume_reset) >= (30 * DAY_IN_SECONDS) {
+            // Issue #121: Automated trigger for Utility Receipt NFT
+            if meter.usage_data.monthly_volume > 0 {
+                if let Some(minter_addr) = env.storage().instance().get::<DataKey, Address>(&DataKey::NFTMinter) {
+                    let cycle_index: u32 = env.storage().instance().get(&DataKey::CycleIndex(signed_data.meter_id)).unwrap_or(0);
+                    let next_cycle = cycle_index + 1;
+                    
+                    let minter = NFTMinterClient::new(&env, &minter_addr);
+                    minter.mint_receipt_nft(&meter.user, &signed_data.meter_id, &next_cycle);
+                    
+                    env.storage().instance().set(&DataKey::CycleIndex(signed_data.meter_id), &next_cycle);
+                    env.events().publish((symbol_short!("NFTMint"), signed_data.meter_id), next_cycle);
+                }
+            }
+
             meter.usage_data.monthly_volume = cost;
             meter.usage_data.last_volume_reset = now;
         } else {
@@ -1797,23 +1844,123 @@ impl UtilityContract {
                 );
 
                 let tax_rate_bps = get_tax_rate_or_default(&env);
-                let tax_receipt = TaxReceipt {
-                    meter_id,
-                    total_amount: settlement.gross_claimed,
-                    tax_amount: settlement.tax_amount,
-                    net_amount: settlement
-                        .provider_payout
-                        .saturating_add(settlement.protocol_fee),
-                    tax_rate_bps,
-                    government_vault: gov_vault,
-                    timestamp: now,
-                };
-                env.events().publish(
-                    (soroban_sdk::symbol_short!("TaxRcpt"), meter_id),
-                    tax_receipt,
-                );
+                let (tax_amount, after_tax_amount) = calculate_tax_split(payout, tax_rate_bps);
+                
+                if tax_amount > 0 {
+                    // Transfer tax to government vault if configured
+                    if let Some(gov_vault) = get_government_vault_or_default(&env) {
+                        client.transfer(&env.current_contract_address(), &gov_vault, &tax_amount);
+                        
+                        // Emit TaxReceipt event
+                        let tax_receipt = TaxReceipt {
+                            meter_id,
+                            total_amount: claimable,
+                            tax_amount,
+                            net_amount: after_tax_amount,
+                            tax_rate_bps,
+                            government_vault: gov_vault.clone(),
+                            timestamp: now,
+                        };
+                        env.events().publish(
+                            (soroban_sdk::symbol_short!("TaxRcpt"), meter_id),
+                            tax_receipt,
+                        );
+                    }
+                }
+                
+                payout = after_tax_amount;
+
+                // Protocol fee (existing logic)
+                if let Some(wallet) = env
+                    .storage()
+                    .instance()
+                    .get::<_, Address>(&DataKey::MaintenanceWallet)
+                {
+                    let fee_bps = get_platform_fee_bps_impl(&env, &meter.user);
+                    let fee = (payout * fee_bps) / 10000;
+                    payout -= fee;
+                    if fee > 0 {
+                        client.transfer(&env.current_contract_address(), &wallet, &fee);
+                    }
+                }
+                if payout > 0 {
+                    client.transfer(&env.current_contract_address(), &meter.provider, &payout);
+                }
+                meter.balance -= claimable;
+                meter.claimed_this_hour += claimable;
+                
+                // If credit drip was active, reduce the debt if in PostPaid mode
+                if meter.billing_type == BillingType::PostPaid && meter.credit_drip_rate > 0 {
+                    let credit_settlement = (elapsed as i128).saturating_mul(meter.credit_drip_rate).min(meter.debt);
+                    meter.debt = meter.debt.saturating_sub(credit_settlement);
+                }
             }
-        }
+        } else {
+            // New hour, reset claimed_this_hour
+            meter.claimed_this_hour = 0;
+
+            // Ensure we don't exceed debt threshold
+            let claimable = if amount > meter.balance && meter.balance - amount >= DEBT_THRESHOLD {
+                amount
+            } else if amount > meter.balance {
+                meter.balance - DEBT_THRESHOLD // Allow going down to threshold
+            } else {
+                amount
+            };
+
+            if claimable > 0 {
+                let client = token::Client::new(&env, &meter.token);
+                let mut payout = claimable;
+
+                // Task #3: Allocate to maintenance fund (0.01% = 1 basis point)
+                allocate_to_maintenance_fund(&env, meter_id, claimable);
+
+                // Task #2: Tax Compliance - Split tax before provider payout
+                let tax_rate_bps = get_tax_rate_or_default(&env);
+                let (tax_amount, after_tax_amount) = calculate_tax_split(payout, tax_rate_bps);
+                
+                if tax_amount > 0 {
+                    // Transfer tax to government vault if configured
+                    if let Some(gov_vault) = get_government_vault_or_default(&env) {
+                        client.transfer(&env.current_contract_address(), &gov_vault, &tax_amount);
+                        
+                        // Emit TaxReceipt event
+                        let tax_receipt = TaxReceipt {
+                            meter_id,
+                            total_amount: claimable,
+                            tax_amount,
+                            net_amount: after_tax_amount,
+                            tax_rate_bps,
+                            government_vault: gov_vault.clone(),
+                            timestamp: now,
+                        };
+                        env.events().publish(
+                            (soroban_sdk::symbol_short!("TaxRcpt"), meter_id),
+                            tax_receipt,
+                        );
+                    }
+                }
+                
+                payout = after_tax_amount;
+
+                // Protocol fee (existing logic)
+                if let Some(wallet) = env
+                    .storage()
+                    .instance()
+                    .get::<_, Address>(&DataKey::MaintenanceWallet)
+                {
+                    let fee_bps = get_platform_fee_bps_impl(&env, &meter.user);
+                    let fee = (payout * fee_bps) / 10000;
+                    payout -= fee;
+                    if fee > 0 {
+                        client.transfer(&env.current_contract_address(), &wallet, &fee);
+                    }
+                }
+                if payout > 0 {
+                    client.transfer(&env.current_contract_address(), &meter.provider, &payout);
+                }
+                meter.balance -= claimable;
+                meter.claimed_this_hour = claimable;
 
         if settlement.protocol_fee > 0 {
             if let Some(wallet) = env
@@ -1887,6 +2034,20 @@ impl UtilityContract {
     pub fn reset_cycle_usage(env: Env, meter_id: u64) {
         let mut meter = get_meter_or_panic(&env, meter_id);
         meter.provider.require_auth();
+
+        // Check for cycle completion manually if provider resets
+        let now = env.ledger().timestamp();
+        if now.saturating_sub(meter.usage_data.last_volume_reset) >= (30 * DAY_IN_SECONDS) && meter.usage_data.current_cycle_watt_hours > 0 {
+            if let Some(minter_addr) = env.storage().instance().get::<DataKey, Address>(&DataKey::NFTMinter) {
+                let cycle_index: u32 = env.storage().instance().get(&DataKey::CycleIndex(meter_id)).unwrap_or(0);
+                let next_cycle = cycle_index + 1;
+                let minter = NFTMinterClient::new(&env, &minter_addr);
+                minter.mint_receipt_nft(&meter.user, &meter_id, &next_cycle);
+                env.storage().instance().set(&DataKey::CycleIndex(meter_id), &next_cycle);
+            }
+        }
+
+        meter.usage_data.last_volume_reset = now;
         meter.usage_data.current_cycle_watt_hours = 0;
         meter.usage_data.last_reading_timestamp = env.ledger().timestamp();
         env.storage()
@@ -2405,6 +2566,12 @@ impl UtilityContract {
                 withdrawal_amount,
             ),
         );
+
+        // Issue #107: Cross-Border Settlement Event for Inter-Anchor communication
+        env.events().publish(
+            (symbol_short!("XBorder"), meter_id),
+            (meter.provider.clone(), destination_token, withdrawal_amount)
+        );
     }
 
     /// Get supported withdrawal tokens for a provider
@@ -2901,11 +3068,8 @@ impl UtilityContract {
 
         if final_claimable > 0 {
             let client = token::Client::new(&env, &meter.token);
-            client.transfer(
-                &env.current_contract_address(),
-                &meter.provider,
-                &final_claimable,
-            );
+            client.transfer(&env.current_contract_address(), &meter.provider, &final_claimable);
+            
             meter.balance -= final_claimable;
             meter.claimed_this_hour += final_claimable;
 

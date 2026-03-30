@@ -29,6 +29,8 @@ pub trait VestingVault {
 #[contractclient(name = "NFTMinterClient")]
 pub trait NFTMinter {
     fn mint_receipt_nft(env: Env, to: Address, meter_id: u64, cycle_index: u32);
+    // Task #126: SBT Minting function
+    fn mint_impact_sbt(env: Env, to: Address, carbon_saved: i128, reliability_score: u32);
 }
 
 #[contracttype]
@@ -44,6 +46,7 @@ mod debt_fuzz_tests;
 mod fuzz_tests;
 #[cfg(test)]
 mod insurance_pool_test;
+mod sbt_minter;
 
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -393,6 +396,8 @@ pub enum DataKey {
     InsuranceRiskAssessment(Address),
     InsuranceNextProposalId,
     InsuranceNextClaimId,
+    // Task #126: Track SBT issuance
+    ImpactSBTMinted(u64),
 }
 
 #[contracterror]
@@ -483,6 +488,9 @@ pub enum ContractError {
     InsufficientVotingPower = 70,
     InvalidProposalType = 71,
     NotImplemented = 72,
+    // Task #126: SBT Errors
+    ImpactNotSignificantEnough = 73,
+    SBTAlreadyMinted = 74,
 }
 
 #[contracttype]
@@ -4582,6 +4590,56 @@ impl UtilityContract {
             total_rebate_distributed: distributed_total,
         }
     }
+    // ============================================================
+        // ISSUE #126: UTILITY IMPACT CREDENTIAL MINTER (SBT)
+        // ============================================================
+
+        /// Allows a user to claim their Green Energy Soulbound Token once they hit
+        /// a 5-year equivalent usage milestone. Fetches their SoroSusu score for metadata.
+        pub fn claim_impact_sbt(env: Env, meter_id: u64) {
+            let meter = get_meter_or_panic(&env, meter_id);
+            meter.user.require_auth();
+
+            // 1. Check if they already claimed their permanent credential
+            if env.storage().instance().get(&DataKey::ImpactSBTMinted(meter_id)).unwrap_or(false) {
+                panic_with_error!(&env, ContractError::SBTAlreadyMinted);
+            }
+
+            // 2. Define the 5-Year Threshold
+            // Example: 10 kWh/day * 365 days * 5 years = 18,250,000 Watt-hours
+            const SBT_GREEN_ENERGY_THRESHOLD: i128 = 18_250_000;
+
+            if meter.usage_data.renewable_watt_hours < SBT_GREEN_ENERGY_THRESHOLD {
+                panic_with_error!(&env, ContractError::ImpactNotSignificantEnough);
+            }
+
+            // 3. Calculate "Carbon Saved"
+            // Simplified metric: 1 Watt-hour of green energy saves ~0.4 grams of CO2
+            let carbon_saved_grams = meter.usage_data.renewable_watt_hours.saturating_mul(4) / 10;
+
+            // 4. Fetch Reliability Score from the SoroSusu Contract
+            let sorosusu_contract = get_sorosusu_contract(&env);
+            let susu_client = SoroSusuClient::new(&env, &sorosusu_contract);
+            let reliability_score = susu_client.get_susu_score(meter.user.clone());
+
+            // 5. Trigger the external NFT/SBT Minter
+            if let Some(minter_addr) = env.storage().instance().get::<DataKey, Address>(&DataKey::NFTMinter) {
+                let minter = NFTMinterClient::new(&env, &minter_addr);
+
+                // Mint the Soulbound Token
+                minter.mint_impact_sbt(&meter.user, &carbon_saved_grams, &reliability_score);
+
+                // Lock it so it can never be minted again for this meter
+                env.storage().instance().set(&DataKey::ImpactSBTMinted(meter_id), &true);
+
+                env.events().publish(
+                    (soroban_sdk::symbol_short!("SBTMint"), meter_id),
+                    (carbon_saved_grams, reliability_score)
+                );
+            } else {
+                panic_with_error!(&env, ContractError::NotImplemented);
+            }
+        }
 }
 
 fn verify_usage_signature(

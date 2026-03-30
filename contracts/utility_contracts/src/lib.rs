@@ -119,6 +119,11 @@ pub struct Meter {
     pub is_closed: bool,
     // Task #1: Stream Priority System
     pub priority_index: u32, // Priority level (0 = highest, higher numbers = lower priority)
+    // Issue #113: Off-Peak Reward
+    pub off_peak_reward_rate_bps: i128,
+    // Issue #106: Milestones
+    pub milestone_deadline: u64,
+    pub milestone_confirmed: bool,
 }
 
 #[contracttype]
@@ -376,6 +381,10 @@ pub enum ContractError {
     SubDaoBudgetExceeded = 47,
     SubDaoNotConfigured = 48,
     InsufficientXlmReserve = 49,
+    // Issue #120
+    UnfairPriceIncrease = 50,
+    // Issue #109
+    BillingGroupNotFound = 51,
 }
 
 #[contracttype]
@@ -635,9 +644,15 @@ fn get_effective_rate(meter: &Meter, timestamp: u64) -> i128 {
     }
 
     if is_peak_hour(timestamp) {
-        base_rate.saturating_mul(PEAK_RATE_MULTIPLIER) / RATE_PRECISION
+        base_rate.saturating_mul(PEAK_RATE_MULTIPLIER) / RATE_PRECISION // Apply peak rate
     } else {
-        base_rate
+        // Issue #113: Apply off-peak reward as a discount
+        if meter.off_peak_reward_rate_bps > 0 && meter.off_peak_reward_rate_bps <= 10000 {
+            let discount = (base_rate * meter.off_peak_reward_rate_bps) / 10000;
+            base_rate.saturating_sub(discount)
+        } else {
+            base_rate
+        }
     }
 }
 
@@ -1157,6 +1172,9 @@ impl UtilityContract {
             credit_drip_rate: 0,
             is_closed: false,
             priority_index, // Task #1: Set priority index
+            off_peak_reward_rate_bps: 0,
+            milestone_deadline: 0,
+            milestone_confirmed: true,
         };
 
         env.storage().instance().set(&DataKey::Meter(count), &meter);
@@ -1951,12 +1969,7 @@ impl UtilityContract {
     }
 
     pub fn set_max_flow_rate(env: Env, meter_id: u64, max_rate_per_hour: i128) {
-        let mut meter: Meter = env
-            .storage()
-            .instance()
-            .get(&DataKey::Meter(meter_id))
-            .ok_or("Meter not found")
-            .unwrap();
+        let mut meter = get_meter_or_panic(&env, meter_id);
         meter.provider.require_auth();
 
         meter.max_flow_rate_per_hour = max_rate_per_hour;
@@ -2378,9 +2391,9 @@ impl UtilityContract {
     pub fn group_top_up(env: Env, parent_account: Address, amount_per_meter: i128) {
         parent_account.require_auth();
         
-        let billing_group: BillingGroup = env.storage().instance()
+        let billing_group: BillingGroup = env.storage().instance().get(&DataKey::BillingGroup(parent_account.clone()))
             .get(&DataKey::BillingGroup(parent_account.clone()))
-            .ok_or("Billing group not found").unwrap();
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::BillingGroupNotFound));
         
         if billing_group.child_meters.is_empty() {
             return;
@@ -2417,9 +2430,9 @@ impl UtilityContract {
     pub fn remove_meter_from_billing_group(env: Env, parent_account: Address, meter_id: u64) {
         parent_account.require_auth();
         
-        let mut billing_group: BillingGroup = env.storage().instance()
+        let mut billing_group: BillingGroup = env.storage().instance().get(&DataKey::BillingGroup(parent_account.clone()))
             .get(&DataKey::BillingGroup(parent_account.clone()))
-            .ok_or("Billing group not found").unwrap();
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::BillingGroupNotFound));
         
         billing_group.child_meters.retain(|&id| id != meter_id);
         env.storage().instance().set(&DataKey::BillingGroup(parent_account), &billing_group);
@@ -3462,6 +3475,106 @@ impl UtilityContract {
             .instance()
             .get(&DataKey::SubDaoConfig(sub_dao))
             .expect("Sub-DAO not configured")
+    }
+
+    // ============================================================
+    // IMPLEMENTATION FOR NEW ISSUES
+    // ============================================================
+
+    /// Issue #120: Batch update service tiers/rates for multiple meters.
+    /// Includes a "Fair Increase" guardrail to prevent price spikes (>10%).
+    pub fn batch_update_rates(env: Env, provider: Address, meter_ids: Vec<u64>, new_rate: i128) {
+        provider.require_auth();
+
+        if meter_ids.is_empty() {
+            return;
+        }
+
+        for meter_id in meter_ids.iter() {
+            let mut meter = get_meter_or_panic(&env, meter_id);
+
+            // Ensure the authenticated provider owns this meter
+            if meter.provider != provider {
+                // Skip meters not owned by the calling provider.
+                continue;
+            }
+
+            // Fair Increase Guardrail: < 10% increase
+            let max_allowed_rate = meter.off_peak_rate.saturating_mul(110) / 100;
+            if new_rate > max_allowed_rate {
+                panic_with_error!(&env, ContractError::UnfairPriceIncrease);
+            }
+
+            if new_rate < 0 {
+                panic_with_error!(&env, ContractError::InvalidUsageValue);
+            }
+
+            meter.off_peak_rate = new_rate;
+            meter.peak_rate = new_rate.saturating_mul(PEAK_RATE_MULTIPLIER) / RATE_PRECISION;
+            meter.rate_per_unit = new_rate;
+
+            env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+        }
+
+        env.events().publish(
+            (symbol_short!("BatchUpd"), provider),
+            (meter_ids.len(), new_rate),
+        );
+    }
+
+    /// Issue #113: Set an off-peak usage reward rate for a meter.
+    /// The reward is applied as a discount to the user.
+    pub fn set_off_peak_reward(env: Env, meter_id: u64, reward_rate_bps: i128) {
+        let mut meter = get_meter_or_panic(&env, meter_id);
+        meter.provider.require_auth();
+
+        // Reward rate should be between 0% and 100% (0-10000 bps)
+        if reward_rate_bps < 0 || reward_rate_bps > 10000 {
+            panic_with_error!(&env, ContractError::InvalidUsageValue);
+        }
+
+        meter.off_peak_reward_rate_bps = reward_rate_bps;
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+
+        env.events().publish(
+            (symbol_short!("OffPekRwd"), meter_id),
+            reward_rate_bps,
+        );
+    }
+
+    /// Issue #106: Set a project milestone deadline.
+    /// If missed, the provider's effective rate is halved.
+    pub fn set_milestone(env: Env, meter_id: u64, deadline: u64) {
+        let mut meter = get_meter_or_panic(&env, meter_id);
+        meter.provider.require_auth();
+
+        meter.milestone_deadline = deadline;
+        meter.milestone_confirmed = false; // New milestone is unconfirmed by default
+
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+
+        env.events().publish(
+            (symbol_short!("MstoneSet"), meter_id),
+            deadline,
+        );
+    }
+
+    /// Issue #106: Allow the user to confirm a milestone is complete.
+    /// This restores the provider's full rate.
+    pub fn confirm_milestone(env: Env, meter_id: u64) {
+        let mut meter = get_meter_or_panic(&env, meter_id);
+        meter.user.require_auth();
+
+        meter.milestone_confirmed = true;
+        // Reset deadline to prevent future penalties until a new milestone is set
+        meter.milestone_deadline = 0;
+
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+
+        env.events().publish(
+            (symbol_short!("MstoneConf"), meter_id),
+            env.ledger().timestamp(),
+        );
     }
 }
 

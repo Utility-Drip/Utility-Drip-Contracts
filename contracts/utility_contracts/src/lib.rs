@@ -355,6 +355,7 @@ pub enum ContractError {
     NotParentDao = 46,
     SubDaoBudgetExceeded = 47,
     SubDaoNotConfigured = 48,
+    InsufficientXlmReserve = 49,
 }
 
 #[contracttype]
@@ -395,6 +396,7 @@ const REFERRAL_REWARD_UNITS: i128 = 500; // 5 units reward for referrals
 // XLM precision constants - XLM has 7 decimal places (0.0000001 minimum)
 const XLM_PRECISION: i128 = 10_000_000; // 10^7 for 7 decimal places
 const XLM_MINIMUM_INCREMENT: i128 = 1; // 1 stroop = 0.0000001 XLM
+const XLM_GAS_RESERVE: i128 = 5 * XLM_PRECISION; // 5 XLM reserved for future transactions
 
 // Task #1: Priority System Constants
 const THROTTLING_THRESHOLD_PERCENT: i128 = 20; // 20% of total balance triggers throttling
@@ -454,9 +456,17 @@ fn convert_xlm_to_usd_cents_with_rounding(xlm_amount: i128, xlm_price_cents: i12
 }
 
 /// Checks if an address represents the native Stellar asset (XLM)
-fn is_native_token(_token_address: &Address) -> bool {
-    // Simplify for consistency with other SAC-compliant tokens.
-    true
+fn is_native_token(env: &Env, token_address: &Address) -> bool {
+    // Treat the contract address as native for internal path-payment flows.
+    if token_address == &env.current_contract_address() {
+        return true;
+    }
+
+    let client = token::Client::new(env, token_address);
+    let symbol = client.symbol();
+
+    symbol == soroban_sdk::String::from_str(env, "XLM")
+        || symbol == soroban_sdk::String::from_str(env, "NATIVE")
 }
 
 /// Transfer tokens, handling both native XLM and SAC tokens
@@ -475,6 +485,21 @@ fn transfer_tokens(
 fn get_token_balance(env: &Env, token_address: &Address, account: &Address) -> i128 {
     let client = token::Client::new(env, token_address);
     client.balance(account)
+}
+
+fn enforce_xlm_gas_reserve(env: &Env, token_address: &Address, payer: &Address, amount: i128) {
+    if amount <= 0 {
+        return;
+    }
+
+    if !is_native_token(env, token_address) {
+        return;
+    }
+
+    let balance = get_token_balance(env, token_address, payer);
+    if balance.saturating_sub(amount) < XLM_GAS_RESERVE {
+        panic_with_error!(env, ContractError::InsufficientXlmReserve);
+    }
 }
 
 fn get_meter_or_panic(env: &Env, meter_id: u64) -> Meter {
@@ -549,7 +574,7 @@ fn convert_usd_to_token_if_needed(env: &Env, usd_cents: i128, destination_token:
             let price_data = oracle_client.get_price();
             
             // If destination is XLM (native token), use existing conversion
-            if is_native_token(destination_token) {
+            if is_native_token(env, destination_token) {
                 let xlm_amount = convert_usd_cents_to_xlm_with_rounding(usd_cents, price_data.price);
                 Ok(xlm_amount)
             } else {
@@ -1246,6 +1271,9 @@ impl UtilityContract {
 
         let was_active = meter.is_active;
         let old_meter_value = provider_meter_value(&meter);
+        // Guard against draining the contributor's XLM gas reserve
+        enforce_xlm_gas_reserve(&env, &meter.token, &contributor, amount);
+
         // Transfer tokens from contributor to contract
         let token_client = token::Client::new(&env, &meter.token);
         token_client.transfer(&contributor, &env.current_contract_address(), &amount);
@@ -1969,7 +1997,7 @@ impl UtilityContract {
             .set(&DataKey::Meter(meter_id), &meter);
 
         // Emit conversion event if XLM was used
-        if is_native_token(&meter.token) {
+        if is_native_token(&env, &meter.token) {
             env.events().publish(
                 (symbol_short!("USDtoXLM"), meter_id),
                 (amount_usd_cents, withdrawal_amount),
@@ -2134,7 +2162,7 @@ impl UtilityContract {
         );
 
         // Emit conversion event if XLM was used
-        if is_native_token(&meter.token) {
+        if is_native_token(&env, &meter.token) {
             env.events().publish(
                 (symbol_short!("RefundUSDToXLM"), meter_id), 
                 (final_refund_amount, withdrawal_amount)
@@ -2324,6 +2352,9 @@ impl UtilityContract {
         // Transfer total amount from parent to contract
         if let Some(first_meter_id) = billing_group.child_meters.first() {
             if let Some(first_meter) = env.storage().instance().get::<_, Meter>(&DataKey::Meter(*first_meter_id)) {
+                // Guard against draining the parent's XLM gas reserve
+                enforce_xlm_gas_reserve(&env, &first_meter.token, &parent_account, total_amount);
+
                 let client = token::Client::new(&env, &first_meter.token);
                 client.transfer(&parent_account, &env.current_contract_address(), &total_amount);
             }

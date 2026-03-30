@@ -360,3 +360,156 @@ fn test_service_sorosusu_debt_noop_when_sorosusu_not_configured() {
 
     assert_eq!(fund_before, client.get_maintenance_fund(&meter_id));
 }
+
+// ==================== PROVIDER RELIABILITY SCORE TESTS ====================
+
+#[test]
+fn test_reliability_score_gold_badge_at_99_percent_uptime() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, UtilityContract);
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let oracle = Address::generate(&env);
+    let provider = Address::generate(&env);
+
+    client.set_oracle(&oracle);
+
+    // Report 99 online out of 100 windows => 9900 bps => Gold
+    for _ in 0..99u32 {
+        client.report_provider_uptime(&provider, &true);
+    }
+    client.report_provider_uptime(&provider, &false);
+
+    let score = client.get_reliability_score(&provider).unwrap();
+    assert_eq!(score.windows_total, 100);
+    assert_eq!(score.windows_online, 99);
+    assert_eq!(score.score_bps, 9900);
+    assert_eq!(score.badge, ReliabilityBadge::Gold);
+
+    assert_eq!(client.get_reliability_badge(&provider), ReliabilityBadge::Gold);
+}
+
+#[test]
+fn test_reliability_score_silver_badge_at_95_percent_uptime() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, UtilityContract);
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let oracle = Address::generate(&env);
+    let provider = Address::generate(&env);
+
+    client.set_oracle(&oracle);
+
+    // 95 online out of 100 => 9500 bps => Silver
+    for _ in 0..95u32 {
+        client.report_provider_uptime(&provider, &true);
+    }
+    for _ in 0..5u32 {
+        client.report_provider_uptime(&provider, &false);
+    }
+
+    let score = client.get_reliability_score(&provider).unwrap();
+    assert_eq!(score.score_bps, 9500);
+    assert_eq!(score.badge, ReliabilityBadge::Silver);
+}
+
+#[test]
+fn test_reliability_score_bronze_badge_at_90_percent_uptime() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, UtilityContract);
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let oracle = Address::generate(&env);
+    let provider = Address::generate(&env);
+
+    client.set_oracle(&oracle);
+
+    // 90 online out of 100 => 9000 bps => Bronze
+    for _ in 0..90u32 {
+        client.report_provider_uptime(&provider, &true);
+    }
+    for _ in 0..10u32 {
+        client.report_provider_uptime(&provider, &false);
+    }
+
+    let score = client.get_reliability_score(&provider).unwrap();
+    assert_eq!(score.score_bps, 9000);
+    assert_eq!(score.badge, ReliabilityBadge::Bronze);
+}
+
+#[test]
+fn test_reliability_score_none_badge_below_90_percent() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, UtilityContract);
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let oracle = Address::generate(&env);
+    let provider = Address::generate(&env);
+
+    client.set_oracle(&oracle);
+
+    // 80 online out of 100 => 8000 bps => None
+    for _ in 0..80u32 {
+        client.report_provider_uptime(&provider, &true);
+    }
+    for _ in 0..20u32 {
+        client.report_provider_uptime(&provider, &false);
+    }
+
+    let score = client.get_reliability_score(&provider).unwrap();
+    assert_eq!(score.score_bps, 8000);
+    assert_eq!(score.badge, ReliabilityBadge::None);
+}
+
+#[test]
+fn test_reliability_score_returns_none_for_unknown_provider() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, UtilityContract);
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let unknown = Address::generate(&env);
+
+    assert!(client.get_reliability_score(&unknown).is_none());
+    assert_eq!(client.get_reliability_badge(&unknown), ReliabilityBadge::None);
+}
+
+#[test]
+fn test_reliability_score_accumulates_across_multiple_reports() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, UtilityContract);
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let oracle = Address::generate(&env);
+    let provider = Address::generate(&env);
+
+    client.set_oracle(&oracle);
+
+    // First batch: 10/10 online => Gold
+    for _ in 0..10u32 {
+        client.report_provider_uptime(&provider, &true);
+    }
+    assert_eq!(client.get_reliability_badge(&provider), ReliabilityBadge::Gold);
+
+    // Second batch: 0/10 online => score drops to 5000 => None
+    for _ in 0..10u32 {
+        client.report_provider_uptime(&provider, &false);
+    }
+
+    let score = client.get_reliability_score(&provider).unwrap();
+    assert_eq!(score.windows_total, 20);
+    assert_eq!(score.windows_online, 10);
+    assert_eq!(score.score_bps, 5000);
+    assert_eq!(score.badge, ReliabilityBadge::None);
+}

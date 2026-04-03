@@ -196,3 +196,167 @@ fn test_batch_register_meters_empty_vector_panics() {
 
     client.batch_register_meters(&empty);
 }
+
+// ==================== INTER-PROTOCOL DEBT SERVICE TESTS ====================
+
+/// Minimal mock SoroSusu contract used only in tests.
+/// Stores a single boolean per user: whether they are in default.
+#[cfg(test)]
+mod mock_sorosusu {
+    use soroban_sdk::{contract, contractimpl, Address, Env};
+
+    #[contract]
+    pub struct MockSoroSusu;
+
+    #[contractimpl]
+    impl MockSoroSusu {
+        pub fn set_default(env: Env, user: Address, in_default: bool) {
+            env.storage().instance().set(&user, &in_default);
+        }
+
+        pub fn is_in_default(env: Env, user: Address) -> bool {
+            env.storage().instance().get(&user).unwrap_or(false)
+        }
+
+        pub fn is_trusted_saver(_env: Env, _user: Address) -> bool {
+            false
+        }
+
+        pub fn get_susu_score(_env: Env, _user: Address) -> u32 {
+            0
+        }
+
+        /// Records a debt payment — in tests we just store the cumulative amount.
+        pub fn record_debt_payment(env: Env, user: Address, amount: i128) {
+            let key = (user.clone(), soroban_sdk::symbol_short!("paid"));
+            let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&key, &current.saturating_add(amount));
+        }
+    }
+}
+
+#[test]
+fn test_service_sorosusu_debt_diverts_5_percent_of_maintenance_fund() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // Deploy utility contract
+    let contract_id = env.register_contract(None, UtilityContract);
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    // Deploy mock SoroSusu
+    let susu_id = env.register_contract(None, mock_sorosusu::MockSoroSusu);
+    let susu_client = mock_sorosusu::MockSoroSusuClient::new(&env, &susu_id);
+
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_address = create_token(&env);
+    let token_admin = token::StellarAssetClient::new(&env, &token_address);
+
+    token_admin.mint(&user, &100_000);
+
+    // Register and fund a meter so the maintenance fund accumulates
+    client.set_tax_rate(&0);
+    let meter_id = client.register_meter(&user, &provider, &10, &token_address, &device_key(&env, 42));
+    client.top_up(&meter_id, &100_000);
+
+    // Manually seed the maintenance fund (simulates accumulated 0.01% allocations)
+    // We do this by advancing time and claiming so allocate_to_maintenance_fund runs,
+    // but for simplicity we verify the function logic directly via a known fund balance.
+    // Seed: inject 10_000 into the maintenance fund via a claim cycle.
+    env.ledger().set_timestamp(env.ledger().timestamp() + 1_000);
+    client.claim(&meter_id);
+
+    let fund_before = client.get_maintenance_fund(&meter_id);
+    // fund_before should be > 0 (1 bps of claimed amount)
+    assert!(fund_before > 0, "maintenance fund should be non-zero after claim");
+
+    // Wire up SoroSusu contract
+    set_sorosusu_contract(env.clone(), susu_id.clone());
+
+    // Mark user as in default on SoroSusu
+    susu_client.set_default(&user, &true);
+
+    // Trigger debt service
+    client.service_sorosusu_debt(&meter_id);
+
+    let fund_after = client.get_maintenance_fund(&meter_id);
+    let expected_divert = (fund_before * 500) / 10_000; // 5%
+    assert_eq!(
+        fund_before - fund_after,
+        expected_divert,
+        "exactly 5% should be diverted from the maintenance fund"
+    );
+
+    // Debt service record should be persisted
+    let record = client.get_debt_service_record(&meter_id).unwrap();
+    assert_eq!(record.meter_id, meter_id);
+    assert_eq!(record.user, user);
+    assert_eq!(record.amount_diverted, expected_divert);
+}
+
+#[test]
+fn test_service_sorosusu_debt_noop_when_user_not_in_default() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, UtilityContract);
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let susu_id = env.register_contract(None, mock_sorosusu::MockSoroSusu);
+
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_address = create_token(&env);
+    let token_admin = token::StellarAssetClient::new(&env, &token_address);
+    token_admin.mint(&user, &100_000);
+
+    client.set_tax_rate(&0);
+    let meter_id = client.register_meter(&user, &provider, &10, &token_address, &device_key(&env, 43));
+    client.top_up(&meter_id, &100_000);
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 1_000);
+    client.claim(&meter_id);
+
+    let fund_before = client.get_maintenance_fund(&meter_id);
+
+    set_sorosusu_contract(env.clone(), susu_id.clone());
+    // user is NOT in default — no diversion should happen
+
+    client.service_sorosusu_debt(&meter_id);
+
+    let fund_after = client.get_maintenance_fund(&meter_id);
+    assert_eq!(fund_before, fund_after, "fund should be unchanged when user is not in default");
+    assert!(client.get_debt_service_record(&meter_id).is_none());
+}
+
+#[test]
+fn test_service_sorosusu_debt_noop_when_sorosusu_not_configured() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, UtilityContract);
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_address = create_token(&env);
+    let token_admin = token::StellarAssetClient::new(&env, &token_address);
+    token_admin.mint(&user, &100_000);
+
+    client.set_tax_rate(&0);
+    let meter_id = client.register_meter(&user, &provider, &10, &token_address, &device_key(&env, 44));
+    client.top_up(&meter_id, &100_000);
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 1_000);
+    client.claim(&meter_id);
+
+    let fund_before = client.get_maintenance_fund(&meter_id);
+
+    // SoroSusu contract is NOT configured — should be a silent no-op
+    client.service_sorosusu_debt(&meter_id);
+
+    assert_eq!(fund_before, client.get_maintenance_fund(&meter_id));
+}

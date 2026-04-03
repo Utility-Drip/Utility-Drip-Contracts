@@ -1,4 +1,4 @@
-use soroban_sdk::{Address, Env};
+use soroban_sdk::{contracttype, Env};
 
 pub struct GasCostEstimator;
 
@@ -12,41 +12,39 @@ impl GasCostEstimator {
     const EMERGENCY_SHUTDOWN: i128 = 2_000_000; // 0.02 XLM
 
     // Estimated monthly operations per meter
-    const CLAIMS_PER_MONTH: u32 = 30; // Assuming daily claims
-    const HEARTBEATS_PER_MONTH: u32 = 720; // Every hour for 30 days
-    const TOP_UPS_PER_MONTH: u32 = 4; // Weekly top-ups
+    const CLAIMS_PER_MONTH: u32 = 30;
+    const HEARTBEATS_PER_MONTH: u32 = 720;
+    const TOP_UPS_PER_MONTH: u32 = 4;
 
     pub fn estimate_meter_monthly_cost(
         _env: &Env,
         is_group_meter: bool,
-        meters_in_group: u32,
+        _meters_in_group: u32,
     ) -> i128 {
-        let mut monthly_cost = Self::REGISTER_METER; // One-time registration
+        let mut monthly_cost = Self::REGISTER_METER;
 
-        // Add recurring costs
         monthly_cost += (Self::CLAIM as u32 * Self::CLAIMS_PER_MONTH) as i128;
         monthly_cost += (Self::UPDATE_HEARTBEAT as u32 * Self::HEARTBEATS_PER_MONTH) as i128;
         monthly_cost += (Self::TOP_UP as u32 * Self::TOP_UPS_PER_MONTH) as i128;
 
-        // For group meters, adjust top-up costs
         if is_group_meter {
-            monthly_cost = monthly_cost - (Self::TOP_UP as u32 * Self::TOP_UPS_PER_MONTH) as i128;
+            monthly_cost -= (Self::TOP_UP as u32 * Self::TOP_UPS_PER_MONTH) as i128;
             monthly_cost += (Self::GROUP_TOP_UP_PER_METER as u32 * Self::TOP_UPS_PER_MONTH) as i128;
         }
 
         monthly_cost
     }
 
+    /// `percentage_group_meters_x100`: percentage * 100 (e.g. 80 = 80%)
     pub fn estimate_provider_monthly_cost(
         _env: &Env,
         number_of_meters: u32,
-        percentage_group_meters: f32,
+        percentage_group_meters_x100: u32,
     ) -> i128 {
-        let group_meters = (number_of_meters as f32 * percentage_group_meters) as u32;
-        let individual_meters = number_of_meters - group_meters;
+        let group_meters = (number_of_meters * percentage_group_meters_x100) / 100;
+        let individual_meters = number_of_meters.saturating_sub(group_meters);
 
         let group_cost = if group_meters > 0 {
-            // Assume average of 5 meters per group
             let groups = group_meters / 5;
             if groups > 0 {
                 Self::estimate_meter_monthly_cost(_env, true, 5) * groups as i128
@@ -63,21 +61,25 @@ impl GasCostEstimator {
         group_cost + individual_cost
     }
 
+    /// `group_billing_enabled`: if true, assumes 80% of meters are in groups
     pub fn estimate_large_scale_cost(
         env: &Env,
         number_of_meters: u32,
         group_billing_enabled: bool,
     ) -> LargeScaleCostEstimate {
-        let percentage_group = if group_billing_enabled { 0.8 } else { 0.0 }; // 80% in groups if enabled
+        let percentage_group_x100: u32 = if group_billing_enabled { 80 } else { 0 };
         let monthly_cost =
-            Self::estimate_provider_monthly_cost(env, number_of_meters, percentage_group);
+            Self::estimate_provider_monthly_cost(env, number_of_meters, percentage_group_x100);
 
         let annual_cost = monthly_cost * 12;
-        let cost_per_meter = monthly_cost / number_of_meters as i128;
+        let cost_per_meter = if number_of_meters > 0 {
+            monthly_cost / number_of_meters as i128
+        } else {
+            0
+        };
 
-        // Convert to XLM (1 XLM = 10,000,000 stroops)
-        let monthly_xlm = monthly_cost / 10_000_000;
-        let annual_xlm = annual_cost / 10_000_000;
+        let monthly_cost_xlm = monthly_cost / 10_000_000;
+        let annual_cost_xlm = annual_cost / 10_000_000;
         let cost_per_meter_xlm = cost_per_meter / 10_000_000;
 
         LargeScaleCostEstimate {
@@ -92,16 +94,27 @@ impl GasCostEstimator {
         }
     }
 
-    pub fn get_operation_cost(operation: &str) -> i128 {
-        match operation {
-            "register_meter" => Self::REGISTER_METER,
-            "top_up" => Self::TOP_UP,
-            "claim" => Self::CLAIM,
-            "update_heartbeat" => Self::UPDATE_HEARTBEAT,
-            "group_top_up" => Self::GROUP_TOP_UP_PER_METER,
-            "emergency_shutdown" => Self::EMERGENCY_SHUTDOWN,
-            _ => 0,
+    pub fn get_operation_cost(operation: &soroban_sdk::String) -> i128 {
+        // Compare operation name by checking known byte patterns
+        if *operation == soroban_sdk::String::from_str(&soroban_sdk::Env::default(), "register_meter") {
+            return Self::REGISTER_METER;
         }
+        if *operation == soroban_sdk::String::from_str(&soroban_sdk::Env::default(), "top_up") {
+            return Self::TOP_UP;
+        }
+        if *operation == soroban_sdk::String::from_str(&soroban_sdk::Env::default(), "claim") {
+            return Self::CLAIM;
+        }
+        if *operation == soroban_sdk::String::from_str(&soroban_sdk::Env::default(), "update_heartbeat") {
+            return Self::UPDATE_HEARTBEAT;
+        }
+        if *operation == soroban_sdk::String::from_str(&soroban_sdk::Env::default(), "group_top_up") {
+            return Self::GROUP_TOP_UP_PER_METER;
+        }
+        if *operation == soroban_sdk::String::from_str(&soroban_sdk::Env::default(), "emergency_shutdown") {
+            return Self::EMERGENCY_SHUTDOWN;
+        }
+        0
     }
 }
 
@@ -116,25 +129,4 @@ pub struct LargeScaleCostEstimate {
     pub annual_cost_xlm: i128,
     pub cost_per_meter_xlm: i128,
     pub group_billing_enabled: bool,
-}
-
-impl LargeScaleCostEstimate {
-    pub fn get_summary(&self) -> String {
-        format!(
-            "Cost Analysis for {} meters:\n\
-             Monthly: {} XLM ({} per meter)\n\
-             Annual: {} XLM ({} per meter)\n\
-             Group Billing: {}",
-            self.number_of_meters,
-            self.monthly_cost_xlm,
-            self.cost_per_meter_xlm,
-            self.annual_cost_xlm,
-            self.cost_per_meter_xlm,
-            if self.group_billing_enabled {
-                "Enabled"
-            } else {
-                "Disabled"
-            }
-        )
-    }
 }

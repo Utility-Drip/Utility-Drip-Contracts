@@ -278,6 +278,29 @@ pub enum VerificationMethod {
     CommunityVoted,
 }
 
+/// Reliability badge tier awarded to a provider based on their uptime score.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ReliabilityBadge {
+    None,   // < 90% uptime
+    Bronze, // >= 90% uptime
+    Silver, // >= 95% uptime
+    Gold,   // >= 99% uptime
+}
+
+/// Tracks a provider's service uptime history and derived reliability score.
+/// Score is stored in basis points (10000 = 100%).
+#[contracttype]
+#[derive(Clone)]
+pub struct ProviderReliabilityScore {
+    pub provider: Address,
+    pub windows_online: u64,   // number of uptime windows reported as online
+    pub windows_total: u64,    // total uptime windows reported
+    pub score_bps: u32,        // uptime score in basis points (0-10000)
+    pub badge: ReliabilityBadge,
+    pub last_updated: u64,
+}
+
 /// Inter-Protocol Debt Service: records a diversion from the maintenance fund
 /// to settle a SoroSusu default on behalf of the meter's user.
 #[contracttype]
@@ -355,16 +378,8 @@ pub enum DataKey {
     // Task #4: Sub-DAO
     SubDaoConfig(Address),
     SoroSusuContract,
-    DebtServiceRecord(u64), // Per-meter record of last debt service diversion
-    // Insurance Pool Keys
-    InsurancePool,
-    InsurancePoolMember(Address),
-    InsuranceProposal(u64),
-    InsuranceVote(Address, u64), // user, proposal_id
-    InsuranceClaim(u64),
-    InsuranceRiskAssessment(Address),
-    InsuranceNextProposalId,
-    InsuranceNextClaimId,
+    DebtServiceRecord(u64),       // Per-meter record of last debt service diversion
+    ReliabilityScore(Address),    // Per-provider reliability score
 }
 
 #[contracterror]
@@ -433,6 +448,9 @@ pub enum ContractError {
     UnfairPriceIncrease = 50,
     // Issue #109
     BillingGroupNotFound = 51,
+    // Reliability Score
+    NotOracle = 52,
+    ProviderNotFound = 53,
 }
 
 #[contracttype]
@@ -492,6 +510,14 @@ const UPGRADE_VETO_PERIOD_SECONDS: u64 = 7 * DAY_IN_SECONDS; // 7 days veto peri
 
 // Inter-Protocol Debt Service Constants
 const DEBT_SERVICE_DIVERT_BPS: i128 = 500; // 5% of maintenance fund diverted per call
+
+// Inter-Protocol Debt Service Constants
+const DEBT_SERVICE_DIVERT_BPS: i128 = 500; // 5% of maintenance fund diverted per call
+
+// Provider Reliability Score Constants
+const RELIABILITY_BADGE_GOLD_BPS: u32 = 9_900;   // 99% uptime
+const RELIABILITY_BADGE_SILVER_BPS: u32 = 9_500;  // 95% uptime
+const RELIABILITY_BADGE_BRONZE_BPS: u32 = 9_000;  // 90% uptime
 
 /// Round XLM amount to nearest minimum increment (0.0000001 XLM)
 /// This prevents value loss over time due to truncation
@@ -1274,6 +1300,18 @@ fn publish_inactive_event(env: &Env, meter_id: u64, now: u64) {
         .publish((symbol_short!("Inactive"), meter_id), now);
 }
 
+fn compute_reliability_badge(score_bps: u32) -> ReliabilityBadge {
+    if score_bps >= RELIABILITY_BADGE_GOLD_BPS {
+        ReliabilityBadge::Gold
+    } else if score_bps >= RELIABILITY_BADGE_SILVER_BPS {
+        ReliabilityBadge::Silver
+    } else if score_bps >= RELIABILITY_BADGE_BRONZE_BPS {
+        ReliabilityBadge::Bronze
+    } else {
+        ReliabilityBadge::None
+    }
+}
+
 #[contractimpl]
 impl UtilityContract {
     pub fn get_minimum_balance_to_flow() -> i128 {
@@ -1324,7 +1362,7 @@ impl UtilityContract {
     }
 
     /// Remove a supported withdrawal token for path payments
-    pub fn remove_supported_withdrawal_token(env: Env, token: Address) {
+    pub fn rm_supported_withdrawal_token(env: Env, token: Address) {
         env.storage()
             .instance()
             .set(&DataKey::SupportedWithdrawalToken(token), &false);
@@ -1537,7 +1575,7 @@ impl UtilityContract {
 
         // Emit single BatchCreated event
         env.events().publish(
-            symbol_short!("BatchCreated"),
+            (symbol_short!("BatchCrtd"),),
             (batch_event.start_id, batch_event.end_id, batch_event.count),
         );
 
@@ -1713,7 +1751,7 @@ impl UtilityContract {
             .set(&DataKey::Meter(meter_id), &meter);
 
         env.events()
-            .publish((symbol_short!("PairComplete"), meter_id), signature);
+            .publish((symbol_short!("PairDone"), meter_id), signature);
     }
 
     pub fn deduct_units(env: Env, signed_data: SignedUsageData) {
@@ -2485,14 +2523,14 @@ impl UtilityContract {
 
         // Emit events
         env.events().publish(
-            (symbol_short!("AccountClosed"), meter_id),
+            (symbol_short!("AcctClosd"), meter_id),
             (refundable_amount, closing_fee_amount, final_refund_amount),
         );
 
         // Emit conversion event if XLM was used
         if is_native_token(&env, &meter.token) {
             env.events().publish(
-                (symbol_short!("RefundUSDToXLM"), meter_id),
+                (symbol_short!("RfndXLM"), meter_id),
                 (final_refund_amount, withdrawal_amount),
             );
         }
@@ -2591,10 +2629,10 @@ impl UtilityContract {
 
         // Emit path payment event
         env.events().publish(
-            (symbol_short!("PathPayment"), meter_id),
+            (symbol_short!("PathPay"), meter_id),
             (
                 meter.token,
-                destination_token,
+                destination_token.clone(),
                 amount_usd_cents,
                 withdrawal_amount,
             ),
@@ -2784,7 +2822,7 @@ impl UtilityContract {
 
         let billing_group = BillingGroup {
             parent_account: parent_account.clone(),
-            child_meters: Vec::new(),
+            child_meters: Vec::new(&env),
             created_at: env.ledger().timestamp(),
         };
 
@@ -2800,13 +2838,13 @@ impl UtilityContract {
             .get(&DataKey::BillingGroup(parent_account.clone()))
             .unwrap_or_else(|| BillingGroup {
                 parent_account: parent_account.clone(),
-                child_meters: Vec::new(),
+                child_meters: Vec::new(&env),
                 created_at: env.ledger().timestamp(),
             });
 
         // Add meter to the group if not already present
         if !billing_group.child_meters.contains(&meter_id) {
-            billing_group.child_meters.push(meter_id);
+            billing_group.child_meters.push_back(meter_id);
             env.storage()
                 .instance()
                 .set(&DataKey::BillingGroup(parent_account), &billing_group);
@@ -2815,27 +2853,27 @@ impl UtilityContract {
 
     pub fn group_top_up(env: Env, parent_account: Address, amount_per_meter: i128) {
         parent_account.require_auth();
-        
-        let billing_group: BillingGroup = env.storage().instance().get(&DataKey::BillingGroup(parent_account.clone()))
+
+        let billing_group: BillingGroup = env
+            .storage()
+            .instance()
             .get(&DataKey::BillingGroup(parent_account.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::BillingGroupNotFound));
-        
+
         if billing_group.child_meters.is_empty() {
             return;
         }
 
         let total_amount = amount_per_meter * billing_group.child_meters.len() as i128;
 
-        // Transfer total amount from parent to contract
+        // Transfer total amount from parent to contract using the first meter's token
         if let Some(first_meter_id) = billing_group.child_meters.first() {
             if let Some(first_meter) = env
                 .storage()
                 .instance()
-                .get::<_, Meter>(&DataKey::Meter(*first_meter_id))
+                .get::<_, Meter>(&DataKey::Meter(first_meter_id))
             {
-                // Guard against draining the parent's XLM gas reserve
                 enforce_xlm_gas_reserve(&env, &first_meter.token, &parent_account, total_amount);
-
                 let client = token::Client::new(&env, &first_meter.token);
                 client.transfer(
                     &parent_account,
@@ -2846,7 +2884,7 @@ impl UtilityContract {
         }
 
         // Distribute funds to all child meters
-        for &meter_id in &billing_group.child_meters {
+        for meter_id in billing_group.child_meters.iter() {
             if let Some(mut meter) = env
                 .storage()
                 .instance()
@@ -2870,27 +2908,28 @@ impl UtilityContract {
 
     pub fn remove_meter_from_billing_group(env: Env, parent_account: Address, meter_id: u64) {
         parent_account.require_auth();
-        
-        let mut billing_group: BillingGroup = env.storage().instance().get(&DataKey::BillingGroup(parent_account.clone()))
-            .get(&DataKey::BillingGroup(parent_account.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::BillingGroupNotFound));
-        
-        billing_group.child_meters.retain(|&id| id != meter_id);
-        env.storage()
-            .instance()
-            .set(&DataKey::BillingGroup(parent_account), &billing_group);
 
-        // Update the meter to remove parent reference
-        if let Some(mut meter) = env
+        let billing_group: BillingGroup = env
             .storage()
             .instance()
-            .get::<_, Meter>(&DataKey::Meter(meter_id))
-        {
-            meter.parent_account = None;
-            env.storage()
-                .instance()
-                .set(&DataKey::Meter(meter_id), &meter);
+            .get(&DataKey::BillingGroup(parent_account.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::BillingGroupNotFound));
+
+        // Rebuild child_meters without the removed meter_id
+        let mut new_meters: Vec<u64> = Vec::new(&env);
+        for id in billing_group.child_meters.iter() {
+            if id != meter_id {
+                new_meters.push_back(id);
+            }
         }
+        let updated = BillingGroup {
+            parent_account: billing_group.parent_account,
+            child_meters: new_meters,
+            created_at: billing_group.created_at,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::BillingGroup(parent_account), &updated);
     }
 
     // Gas Cost Estimator Functions
@@ -2905,12 +2944,12 @@ impl UtilityContract {
     pub fn estimate_provider_monthly_cost(
         env: Env,
         number_of_meters: u32,
-        percentage_group_meters: f32,
+        percentage_group_meters_x100: u32,
     ) -> i128 {
         GasCostEstimator::estimate_provider_monthly_cost(
             &env,
             number_of_meters,
-            percentage_group_meters,
+            percentage_group_meters_x100,
         )
     }
 
@@ -3016,7 +3055,7 @@ impl UtilityContract {
     }
 
     pub fn get_pending_alerts(env: Env, user: Address) -> Vec<LowBalanceAlert> {
-        let mut alerts = Vec::new();
+        let mut alerts = Vec::new(&env);
 
         // This is a simplified implementation
         // In practice, you'd want to iterate through storage more efficiently
@@ -3040,7 +3079,7 @@ impl UtilityContract {
                             .instance()
                             .get::<_, LowBalanceAlert>(&DataKey::Alert(meter_id, alert_time))
                         {
-                            alerts.push(alert);
+                            alerts.push_back(alert);
                         }
                     }
                 }
@@ -3313,7 +3352,7 @@ impl UtilityContract {
             .set(&DataKey::GovernmentVault, &vault_address);
 
         env.events()
-            .publish(soroban_sdk::symbol_short!("GovVault"), vault_address);
+            .publish((soroban_sdk::symbol_short!("GovVault"),), vault_address);
     }
 
     // Task #2: Tax Compliance - Set tax rate (in basis points)
@@ -3328,7 +3367,7 @@ impl UtilityContract {
             .set(&DataKey::TaxRateBps, &tax_rate_bps);
 
         env.events()
-            .publish(soroban_sdk::symbol_short!("TaxRate"), tax_rate_bps);
+            .publish((soroban_sdk::symbol_short!("TaxRate"),), tax_rate_bps);
     }
 
     // Task #3: Self-Maintenance - Get maintenance fund balance for a meter
@@ -3393,7 +3432,7 @@ impl UtilityContract {
         let proposal_id = propose_upgrade_impl(&env, new_wasm_hash, &proposer);
 
         env.events()
-            .publish(soroban_sdk::symbol_short!("UpgrdProp"), proposal_id);
+            .publish((soroban_sdk::symbol_short!("UpgrdProp"),), proposal_id);
     }
 
     // Task #4: Wasm Hash Rotation - Submit veto
@@ -3433,7 +3472,7 @@ impl UtilityContract {
         // In a real implementation, this would call env.deployer().update_current_contract_wasm()
         // For now, we just emit an event indicating the upgrade is ready
         env.events().publish(
-            soroban_sdk::symbol_short!("UpgrdFinsh"),
+            (soroban_sdk::symbol_short!("UpgrdFin"),),
             proposal.new_wasm_hash,
         );
 
@@ -3831,7 +3870,7 @@ impl UtilityContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::VerifiedProvider(provider), &verified_provider);
+            .set(&DataKey::VerifiedProvider(provider.clone()), &verified_provider);
 
         env.events()
             .publish((soroban_sdk::symbol_short!("VrfReqst"),), provider);
@@ -3919,7 +3958,7 @@ impl UtilityContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::SubDaoConfig(sub_dao), &config);
+            .set(&DataKey::SubDaoConfig(sub_dao.clone()), &config);
 
         env.events().publish(
             (soroban_sdk::symbol_short!("SubDaoCr"),),
@@ -3962,7 +4001,7 @@ impl UtilityContract {
 
         // Create the meter using standard logic
         let meter_id = register_meter_internal(
-            env,
+            env.clone(),
             user,
             provider,
             off_peak_rate,
@@ -3977,7 +4016,7 @@ impl UtilityContract {
         updated_config.spent_budget += off_peak_rate; // Simplified accounting
         env.storage()
             .instance()
-            .set(&DataKey::SubDaoConfig(sub_dao), &updated_config);
+            .set(&DataKey::SubDaoConfig(sub_dao.clone()), &updated_config);
 
         env.events()
             .publish((soroban_sdk::symbol_short!("SubDaoStr"), meter_id), sub_dao);
@@ -4005,7 +4044,7 @@ impl UtilityContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::SubDaoConfig(sub_dao), &config);
+            .set(&DataKey::SubDaoConfig(sub_dao.clone()), &config);
 
         env.events().publish(
             (soroban_sdk::symbol_short!("SubDaoRcl"),),
@@ -4031,7 +4070,7 @@ impl UtilityContract {
         config.is_active = false;
         env.storage()
             .instance()
-            .set(&DataKey::SubDaoConfig(sub_dao), &config);
+            .set(&DataKey::SubDaoConfig(sub_dao.clone()), &config);
 
         env.events()
             .publish((soroban_sdk::symbol_short!("SubDaoOff"),), sub_dao);
@@ -4140,9 +4179,89 @@ impl UtilityContract {
         env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
 
         env.events().publish(
-            (symbol_short!("MstoneConf"), meter_id),
+            (symbol_short!("MstoneCnf"), meter_id),
             env.ledger().timestamp(),
         );
+    }
+
+    // ==================== PROVIDER RELIABILITY SCORE API ====================
+
+    /// Report a provider's uptime for one observation window.
+    ///
+    /// Only the configured oracle may call this. Each call represents one
+    /// observation window (e.g. 1 hour). `was_online` indicates whether the
+    /// provider's service was reachable during that window.
+    ///
+    /// The score is recalculated as:
+    ///   score_bps = (windows_online * 10_000) / windows_total
+    ///
+    /// Badge tiers are updated automatically:
+    ///   Gold   >= 99%  (9900 bps)
+    ///   Silver >= 95%  (9500 bps)
+    ///   Bronze >= 90%  (9000 bps)
+    ///   None    < 90%
+    pub fn report_provider_uptime(env: Env, provider: Address, was_online: bool) {
+        // Only the oracle may submit uptime reports
+        let oracle = get_oracle_or_panic(&env);
+        oracle.require_auth();
+
+        let now = env.ledger().timestamp();
+
+        let mut score: ProviderReliabilityScore = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReliabilityScore(provider.clone()))
+            .unwrap_or(ProviderReliabilityScore {
+                provider: provider.clone(),
+                windows_online: 0,
+                windows_total: 0,
+                score_bps: 0,
+                badge: ReliabilityBadge::None,
+                last_updated: now,
+            });
+
+        score.windows_total = score.windows_total.saturating_add(1);
+        if was_online {
+            score.windows_online = score.windows_online.saturating_add(1);
+        }
+
+        // Recalculate score in basis points
+        score.score_bps = if score.windows_total > 0 {
+            ((score.windows_online * 10_000) / score.windows_total) as u32
+        } else {
+            0
+        };
+
+        // Assign badge tier
+        score.badge = compute_reliability_badge(score.score_bps);
+        score.last_updated = now;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ReliabilityScore(provider.clone()), &score);
+
+        env.events().publish(
+            (symbol_short!("Uptime"), provider),
+            (was_online, score.score_bps),
+        );
+    }
+
+    /// Query a provider's full reliability score record.
+    /// Returns `None` if no uptime data has been reported yet.
+    pub fn get_reliability_score(env: Env, provider: Address) -> Option<ProviderReliabilityScore> {
+        env.storage()
+            .instance()
+            .get(&DataKey::ReliabilityScore(provider))
+    }
+
+    /// Query a provider's current reliability badge tier.
+    /// Returns `ReliabilityBadge::None` if no data exists or uptime is below 90%.
+    pub fn get_reliability_badge(env: Env, provider: Address) -> ReliabilityBadge {
+        env.storage()
+            .instance()
+            .get::<DataKey, ProviderReliabilityScore>(&DataKey::ReliabilityScore(provider))
+            .map(|s| s.badge)
+            .unwrap_or(ReliabilityBadge::None)
     }
 
     // ==================== INTER-PROTOCOL DEBT SERVICE ====================

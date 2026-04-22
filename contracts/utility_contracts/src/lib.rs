@@ -85,6 +85,8 @@ pub struct UsageData {
 
 mod gas_estimator;
 use gas_estimator::GasCostEstimator;
+
+pub mod grant_stream_listener;
 #[contracttype]
 #[derive(Clone)]
 pub struct Meter {
@@ -144,6 +146,37 @@ pub struct ImpactMetrics {
     pub total_kilowatts_funded: i128,
     pub total_liters_streamed: i128,
     pub active_meters: u32,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ConservationGoal {
+    pub goal_id: u64,
+    pub provider: Address,
+    pub target_water_savings: i128,  // in liters
+    pub current_savings: i128,
+    pub deadline: u64,
+    pub is_active: bool,
+    pub grant_amount: i128,  // grant amount when goal is reached
+    pub grant_token: Address,
+    pub created_at: u64,
+    pub achieved_at: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct GoalReachedEvent {
+    pub goal_id: u64,
+    pub provider: Address,
+    pub water_savings: i128,
+    pub grant_amount: i128,
+    pub grant_token: Address,
+    pub achieved_at: u64,
+}
+
+#[contractclient(name = "GrantStreamClient")]
+pub trait GrantStream {
+    fn on_goal_reached(env: Env, goal_event: GoalReachedEvent);
 }
 
 // Issue #118: Zero-Knowledge Privacy Usage Reporting
@@ -393,6 +426,13 @@ pub enum ContractError {
     CommitmentNotFound = 67,
     InvalidBillingCycle = 68,
     ZKVerificationFailed = 69,
+    // Issue #130: Grant Stream Integration Errors
+    ConservationGoalNotFound = 70,
+    GoalAlreadyAchieved = 71,
+    GoalExpired = 72,
+    InvalidGrantAmount = 73,
+    GrantStreamNotConfigured = 74,
+    InsufficientWaterSavings = 75,
 }
 
 #[contracttype]
@@ -909,6 +949,198 @@ impl UtilityContract {
     /// Remove a supported withdrawal token for path payments
     pub fn remove_supported_withdrawal_token(env: Env, token: Address) {
         env.storage().instance().set(&DataKey::SupportedWithdrawalToken(token), &false);
+    }
+
+    // ==================== ISSUE #130: GRANT STREAM INTEGRATION ====================
+
+    /// Create a new conservation goal for a provider
+    pub fn create_conservation_goal(
+        env: Env,
+        provider: Address,
+        target_water_savings: i128,
+        deadline: u64,
+        grant_amount: i128,
+        grant_token: Address,
+    ) -> u64 {
+        provider.require_auth();
+
+        if target_water_savings <= 0 {
+            panic_with_error!(&env, ContractError::InvalidGrantAmount);
+        }
+
+        if grant_amount <= 0 {
+            panic_with_error!(&env, ContractError::InvalidGrantAmount);
+        }
+
+        // Generate unique goal ID
+        let goal_count: u64 = env.storage()
+            .instance()
+            .get(&DataKey::Count)
+            .unwrap_or(0);
+        let goal_id = goal_count + 1;
+
+        let now = env.ledger().timestamp();
+
+        let goal = ConservationGoal {
+            goal_id,
+            provider: provider.clone(),
+            target_water_savings,
+            current_savings: 0,
+            deadline,
+            is_active: true,
+            grant_amount,
+            grant_token: grant_token.clone(),
+            created_at: now,
+            achieved_at: None,
+        };
+
+        env.storage().instance().set(&DataKey::ConservationGoal(goal_id), &goal);
+        env.storage().instance().set(&DataKey::Count, &goal_id);
+
+        // Emit goal creation event
+        env.events().publish(
+            (symbol_short!("GoalCr"), goal_id),
+            (provider, target_water_savings, deadline, grant_amount),
+        );
+
+        goal_id
+    }
+
+    /// Update water savings for a conservation goal
+    pub fn update_water_savings(env: Env, goal_id: u64, additional_savings: i128) {
+        if additional_savings <= 0 {
+            panic_with_error!(&env, ContractError::InvalidUsageValue);
+        }
+
+        let mut goal: ConservationGoal = env.storage()
+            .instance()
+            .get(&DataKey::ConservationGoal(goal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ConservationGoalNotFound));
+
+        goal.provider.require_auth();
+
+        if !goal.is_active {
+            panic_with_error!(&env, ContractError::GoalAlreadyAchieved);
+        }
+
+        let now = env.ledger().timestamp();
+        if now > goal.deadline {
+            goal.is_active = false;
+            env.storage().instance().set(&DataKey::ConservationGoal(goal_id), &goal);
+            panic_with_error!(&env, ContractError::GoalExpired);
+        }
+
+        goal.current_savings += additional_savings;
+
+        // Check if goal is achieved
+        if goal.current_savings >= goal.target_water_savings {
+            goal.is_active = false;
+            goal.achieved_at = Some(now);
+
+            // Create GoalReached event
+            let goal_event = GoalReachedEvent {
+                goal_id,
+                provider: goal.provider.clone(),
+                water_savings: goal.current_savings,
+                grant_amount: goal.grant_amount,
+                grant_token: goal.grant_token.clone(),
+                achieved_at: now,
+            };
+
+            // Emit GoalReached event
+            env.events().publish(
+                (symbol_short!("GoalRch"), goal_id),
+                (goal.provider.clone(), goal.current_savings, goal.grant_amount),
+            );
+
+            // Notify Grant Stream contract if configured
+            if let Some(grant_stream_address) = env.storage().instance().get::<_, Address>(&DataKey::GrantStreamMatch(goal_id, goal.provider.clone())) {
+                let grant_stream_client = GrantStreamClient::new(&env, &grant_stream_address);
+                grant_stream_client.on_goal_reached(goal_event);
+            }
+        }
+
+        env.storage().instance().set(&DataKey::ConservationGoal(goal_id), &goal);
+    }
+
+    /// Configure Grant Stream contract to listen for goal achievements
+    pub fn configure_grant_stream_match(env: Env, goal_id: u64, grant_stream_contract: Address) {
+        let goal: ConservationGoal = env.storage()
+            .instance()
+            .get(&DataKey::ConservationGoal(goal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ConservationGoalNotFound));
+
+        goal.provider.require_auth();
+
+        env.storage().instance().set(&DataKey::GrantStreamMatch(goal_id, goal.provider.clone()), &grant_stream_contract);
+
+        env.events().publish(
+            (symbol_short!("GrantCfg"), goal_id),
+            (goal.provider.clone(), grant_stream_contract),
+        );
+    }
+
+    /// Get conservation goal details
+    pub fn get_conservation_goal(env: Env, goal_id: u64) -> ConservationGoal {
+        env.storage()
+            .instance()
+            .get(&DataKey::ConservationGoal(goal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ConservationGoalNotFound))
+    }
+
+    /// Get all active conservation goals for a provider
+    pub fn get_provider_conservation_goals(env: Env, provider: Address) -> Vec<u64> {
+        let mut goal_ids = Vec::new(&env);
+        let count: u64 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
+
+        for goal_id in 1..=count {
+            if let Some(goal) = env.storage().instance().get::<_, ConservationGoal>(&DataKey::ConservationGoal(goal_id)) {
+                if goal.provider == provider && goal.is_active {
+                    goal_ids.push_back(goal_id);
+                }
+            }
+        }
+
+        goal_ids
+    }
+
+    /// Check if a goal has been achieved and trigger grant if needed
+    pub fn check_and_trigger_grant(env: Env, goal_id: u64) {
+        let goal: ConservationGoal = env.storage()
+            .instance()
+            .get(&DataKey::ConservationGoal(goal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ConservationGoalNotFound));
+
+        if goal.current_savings >= goal.target_water_savings && goal.is_active {
+            // Goal should have been triggered, manually trigger now
+            let mut updated_goal = goal;
+            let now = env.ledger().timestamp();
+            updated_goal.is_active = false;
+            updated_goal.achieved_at = Some(now);
+
+            let goal_event = GoalReachedEvent {
+                goal_id,
+                provider: goal.provider.clone(),
+                water_savings: goal.current_savings,
+                grant_amount: goal.grant_amount,
+                grant_token: goal.grant_token.clone(),
+                achieved_at: now,
+            };
+
+            // Emit GoalReached event
+            env.events().publish(
+                (symbol_short!("GoalRch"), goal_id),
+                (goal.provider.clone(), goal.current_savings, goal.grant_amount),
+            );
+
+            // Notify Grant Stream contract if configured
+            if let Some(grant_stream_address) = env.storage().instance().get::<_, Address>(&DataKey::GrantStreamMatch(goal_id, goal.provider.clone())) {
+                let grant_stream_client = GrantStreamClient::new(&env, &grant_stream_address);
+                grant_stream_client.on_goal_reached(goal_event);
+            }
+
+            env.storage().instance().set(&DataKey::ConservationGoal(goal_id), &updated_goal);
+        }
     }
 
     /// Set green energy discount for a specific meter (in basis points)

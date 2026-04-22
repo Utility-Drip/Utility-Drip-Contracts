@@ -1,11 +1,10 @@
 {
   "generators": {
-    "address": 2,
+    "address": 5,
     "nonce": 0,
     "mux_id": 0
   },
   "auth": [
-    [],
     [],
     [],
     []
@@ -39,12 +38,24 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "NativeToken"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "Oracle"
                           }
                         ]
                       },
                       "val": {
-                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
                       }
                     }
                   ]

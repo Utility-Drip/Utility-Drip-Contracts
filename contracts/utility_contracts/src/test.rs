@@ -567,7 +567,7 @@ fn test_variable_rate_tariffs_peak_vs_offpeak() {
     assert_eq!(meter.off_peak_rate, 10);
     assert_eq!(meter.peak_rate, 15);
 
-    client.top_up(&meter_id, &1000);
+    client.top_up(&meter_id, &10_000);
 
     // Test OFF-PEAK claim: timestamp = 46800 (13:00 UTC)
     // This is before peak hours (18:00-21:00), so use off_peak_rate
@@ -629,7 +629,7 @@ fn test_variable_rate_deduct_units_respects_peak_hours() {
     // Register with off-peak rate of 20 tokens/second
     let device_public_key = BytesN::from_array(&env, &[0u8; 32]);
     let meter_id = client.register_meter(&user, &provider, &20, &token_address, &device_public_key, &100000, &0);
-    client.top_up(&meter_id, &2000);
+    client.top_up(&meter_id, &20_000);
 
     // OFF-PEAK deduction at 10:00 UTC
     env.ledger().set_timestamp(36000); // 10:00 UTC
@@ -750,6 +750,128 @@ fn test_public_key_mismatch() {
 }
 
 #[test]
+fn test_saving_goal_auto_purchase_flow() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let marketplace = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
+    let token = token::Client::new(&env, &token_address);
+
+    token_admin_client.mint(&user, &200000);
+
+    let device_public_key = BytesN::from_array(&env, &[1u8; 32]);
+    let meter_id = client.register_meter(&user, &provider, &10, &token_address, &device_public_key, &2000000000, &0);
+    client.top_up(&meter_id, &150000);
+
+    // Set goal: 1000 USDcents
+    client.setup_saving_goal(&meter_id, &1000, &marketplace);
+
+    // Initial claim: 4s * 10 tokens/s = 40 tokens total. 
+    // 20% (8 tokens) goes to savings. 32 tokens to provider.
+    env.ledger().set_timestamp(env.ledger().timestamp() + 4);
+    client.claim(&meter_id);
+
+    let goal = client.get_saving_goal(&meter_id).unwrap();
+    assert_eq!(goal.current_savings, 8);
+    assert_eq!(token.balance(&provider), 32);
+
+    // Claim more to hit goal
+    // We need 1000 total. We have 8. Need 992 more.
+    // Each 1s gives 2 in savings. Need 496 more seconds.
+    env.ledger().set_timestamp(env.ledger().timestamp() + 500);
+    client.claim(&meter_id);
+
+    let goal = client.get_saving_goal(&meter_id).unwrap();
+    assert!(goal.is_completed);
+    assert!(goal.current_savings >= 1000);
+}
+
+#[test]
+fn test_seasonal_factor_affects_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
+    let token = token::Client::new(&env, &token_address);
+
+    token_admin_client.mint(&user, &10000);
+
+    let device_public_key = BytesN::from_array(&env, &[1u8; 32]);
+    let meter_id = client.register_meter(&user, &provider, &10, &token_address, &device_public_key, &2000000000, &0);
+    client.top_up(&meter_id, &5000);
+
+    // No seasonal factor (default 100%)
+    env.ledger().set_timestamp(env.ledger().timestamp() + 10);
+    client.claim(&meter_id);
+    assert_eq!(token.balance(&provider), 100);
+
+    // Seasonal factor: 150% (Summer demand)
+    client.set_seasonal_factor(&150);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 10);
+    client.claim(&meter_id);
+    // Rate is now 10 * 1.5 = 15. 10s * 15 = 150 tokens.
+    // Total provider balance: 100 + 150 = 250
+    assert_eq!(token.balance(&provider), 250);
+}
+
+#[test]
+fn test_sustainability_fee_tax_redirection() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
+    let token = token::Client::new(&env, &token_address);
+
+    client.set_treasury(&treasury);
+    token_admin_client.mint(&user, &500_000_000);
+
+    let device_public_key = BytesN::from_array(&env, &[1u8; 32]);
+    let meter_id = client.register_meter(&user, &provider, &1, &token_address, &device_public_key, &2000000000, &0);
+    client.set_max_flow_rate(&meter_id, &50_000_000);
+    client.top_up(&meter_id, &200_000_000);
+
+    // Initial claim to cross threshold ($100k = 10,000,000 cents)
+    // Claim 10M units. Rate is 1. 10M tokens.
+    env.ledger().set_timestamp(env.ledger().timestamp() + 10_000_000);
+    client.claim(&meter_id);
+    
+    // First 10M had no tax (threshold not crossed yet).
+    assert_eq!(token.balance(&provider), 10_000_000);
+    assert_eq!(token.balance(&treasury), 0);
+
+    // Second claim: threshold is now met.
+    // Claim 1M units. 0.1% fee = 1,000 tokens.
+    env.ledger().set_timestamp(env.ledger().timestamp() + 1_000_000);
+    client.claim(&meter_id);
+
+    assert_eq!(token.balance(&treasury), 1_000);
+    assert_eq!(token.balance(&provider), 10_999_000); // 10M + 1M - 1000
+}
+
+#[test]
 fn test_update_device_public_key() {
     let env = Env::default();
     env.mock_all_auths();
@@ -798,8 +920,9 @@ fn test_xlm_to_usd_conversion_top_up() {
     let mock_oracle = MockPriceOracle::new(&env, 150, 2);
     client.set_oracle(&mock_oracle.address());
 
-    // Use native token (XLM) - represented by empty address for testing
-    let xlm_address = Address::generate(&env); // In real scenario, this would be native token
+    // Use native token (XLM) - represented by xlm_address for testing
+    let xlm_address = Address::generate(&env); 
+    client.set_native_token(&xlm_address);
     
     let device_public_key = BytesN::from_array(&env, &[0u8; 32]);
     let meter_id = client.register_meter(&user, &provider, &10, &xlm_address, &device_public_key, &100000, &0);
@@ -893,6 +1016,7 @@ fn test_withdraw_earnings_xlm_conversion() {
     client.set_oracle(&mock_oracle.address());
 
     let xlm_address = Address::generate(&env);
+    client.set_native_token(&xlm_address);
     let device_public_key = BytesN::from_array(&env, &[0u8; 32]);
     let meter_id = client.register_meter(&user, &provider, &10, &xlm_address, &device_public_key, &200000, &0);
     
@@ -942,7 +1066,8 @@ fn test_prepaid_meter_flow_with_native_xlm() {
     client.set_oracle(&oracle);
 
     // Use native XLM address
-    let native_token_address = super::get_native_token_address(&env);
+    let native_token_address = Address::generate(&env);
+    client.set_native_token(&native_token_address);
     let native_token = token::Client::new(&env, &native_token_address);
     let native_token_admin = token::StellarAssetClient::new(&env, &native_token_address);
     
@@ -1012,7 +1137,8 @@ fn test_postpaid_meter_flow_with_native_xlm() {
     client.set_oracle(&oracle);
 
     // Use native XLM address
-    let native_token_address = super::get_native_token_address(&env);
+    let native_token_address = Address::generate(&env);
+    client.set_native_token(&native_token_address);
     let native_token = token::Client::new(&env, &native_token_address);
     let native_token_admin = token::StellarAssetClient::new(&env, &native_token_address);
     

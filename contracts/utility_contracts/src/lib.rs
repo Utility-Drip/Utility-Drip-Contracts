@@ -53,6 +53,15 @@ pub struct UsageData {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SavingGoal {
+    pub target_amount: i128,    // goal in USD cents
+    pub current_savings: i128, // currently saved in USD cents
+    pub marketplace: Address,  // where to spend
+    pub is_completed: bool,
+}
+
+#[contracttype]
 #[derive(Clone)]
 pub struct Meter {
     pub user: Address,
@@ -92,6 +101,11 @@ pub enum DataKey {
     Count,
     Oracle,
     ActiveMetersCount,
+    SeasonalFactor,
+    Treasury,
+    ProviderVolume(Address),
+    SavingGoal(u64),
+    NativeToken,
 }
 
 #[contracterror]
@@ -111,6 +125,8 @@ pub enum ContractError {
     TimestampTooOld = 11,
     StreamNotFinished = 12,
     BalanceNotEmpty = 13,
+    GoalAlreadyMet = 14,
+    GoalNotFound = 15,
 }
 
 #[contract]
@@ -159,7 +175,10 @@ const PEAK_RATE_MULTIPLIER: i128 = 3; // 1.5x => stored as 3 (divide by 2)
 const RATE_PRECISION: i128 = 2; // Precision for rate calculations
 
 fn is_native_token(env: &Env, token_address: &Address) -> bool {
-    token_address == &get_native_token_address(env)
+    match env.storage().instance().get::<DataKey, Address>(&DataKey::NativeToken) {
+        Some(native) => token_address == &native,
+        None => false,
+    }
 }
 
 fn transfer_tokens(env: Env, token_address: &Address, from: &Address, to: &Address, amount: &i128) {
@@ -172,10 +191,6 @@ fn get_token_balance(env: Env, token_address: &Address, account: &Address) -> i1
     client.balance(account)
 }
 
-/// Get the native token address for testing purposes
-fn get_native_token_address(env: &Env) -> Address {
-    Address::from_str(env, "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2Y2W3U2XPIVVU4XZQ4")
-}
 
 fn get_meter_or_panic(env: &Env, meter_id: u64) -> Meter {
     match env
@@ -228,12 +243,19 @@ fn is_peak_hour(timestamp: u64) -> bool {
     seconds_in_day >= PEAK_HOUR_START && seconds_in_day < PEAK_HOUR_END
 }
 
-fn get_effective_rate(meter: &Meter, timestamp: u64) -> i128 {
-    if is_peak_hour(timestamp) {
+fn get_seasonal_multiplier(env: &Env) -> i128 {
+    env.storage().instance().get(&DataKey::SeasonalFactor).unwrap_or(100)
+}
+
+fn get_effective_rate(env: &Env, meter: &Meter, timestamp: u64) -> i128 {
+    let base_rate = if is_peak_hour(timestamp) {
         meter.peak_rate
     } else {
         meter.off_peak_rate
-    }
+    };
+    
+    let multiplier = get_seasonal_multiplier(env);
+    base_rate.saturating_mul(multiplier) / 100
 }
 
 fn provider_meter_value(meter: &Meter) -> i128 {
@@ -333,13 +355,58 @@ fn apply_provider_withdrawal_limit(
     window
 }
 
-fn apply_provider_claim(env: &Env, meter: &mut Meter, amount: i128) {
+fn apply_provider_claim(env: &Env, meter: &mut Meter, meter_id: u64, amount: i128) {
     if amount <= 0 {
         return;
     }
 
-    transfer_tokens(env.clone(), &meter.token, &env.current_contract_address(), &meter.provider, &amount);
+    let mut provider_share = amount;
+    
+    // 1. Handle Saving Goal (#115)
+    if let Some(mut goal) = env.storage().instance().get::<DataKey, SavingGoal>(&DataKey::SavingGoal(meter_id)) {
+        if !goal.is_completed {
+            let contribution = amount / 5; // Fixed 20% redirection for saving upgrades
+            goal.current_savings = goal.current_savings.saturating_add(contribution);
+            provider_share = provider_share.saturating_sub(contribution);
 
+            if goal.current_savings >= goal.target_amount {
+                goal.is_completed = true;
+                env.events().publish(
+                    (symbol_short!("AutoBuy"), meter.user.clone()), 
+                    (goal.marketplace.clone(), goal.target_amount)
+                );
+            }
+            env.storage().instance().set(&DataKey::SavingGoal(meter_id), &goal);
+        }
+    }
+
+    // 2. Handle Sustainability Fee (#132)
+    let mut provider_vol = env.storage().instance()
+        .get::<DataKey, i128>(&DataKey::ProviderVolume(meter.provider.clone()))
+        .unwrap_or(0);
+    
+    let mut transfer_to_provider = provider_share;
+    
+    if provider_vol >= 10_000_000 { // $100k Threshold (10,000,000 cents)
+        let fee = provider_share / 1000; // 0.1% Maintenance Tax
+        if fee > 0 {
+            if let Some(treasury) = env.storage().instance().get::<DataKey, Address>(&DataKey::Treasury) {
+                transfer_tokens(env.clone(), &meter.token, &env.current_contract_address(), &treasury, &fee);
+                transfer_to_provider = transfer_to_provider.saturating_sub(fee);
+            }
+        }
+    }
+
+    // 3. Final Transfers
+    if transfer_to_provider > 0 {
+        transfer_tokens(env.clone(), &meter.token, &env.current_contract_address(), &meter.provider, &transfer_to_provider);
+    }
+    
+    // Update lifetime volume
+    provider_vol = provider_vol.saturating_add(provider_share);
+    env.storage().instance().set(&DataKey::ProviderVolume(meter.provider.clone()), &provider_vol);
+
+    // 4. Update Meter State
     match meter.billing_type {
         BillingType::PrePaid => {
             meter.balance = meter.balance.saturating_sub(amount);
@@ -366,6 +433,39 @@ fn publish_inactive_event(env: &Env, meter_id: u64, now: u64) {
 impl UtilityContract {
     pub fn set_oracle(env: Env, oracle: Address) {
         env.storage().instance().set(&DataKey::Oracle, &oracle);
+    }
+
+    pub fn set_native_token(env: Env, native_token: Address) {
+        env.storage().instance().set(&DataKey::NativeToken, &native_token);
+    }
+
+    pub fn set_seasonal_factor(env: Env, factor: i128) {
+        // Only contract or authorized admin should call this. 
+        // For simple project, let's assume oracle/admin auth.
+        env.storage().instance().set(&DataKey::SeasonalFactor, &factor);
+    }
+
+    pub fn set_treasury(env: Env, treasury: Address) {
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
+    }
+
+    pub fn setup_saving_goal(
+        env: Env, 
+        meter_id: u64, 
+        target_amount: i128, 
+        marketplace: Address
+    ) {
+        let meter = get_meter_or_panic(&env, meter_id);
+        meter.user.require_auth();
+        
+        let goal = SavingGoal {
+            target_amount,
+            current_savings: 0,
+            marketplace,
+            is_completed: false,
+        };
+        
+        env.storage().instance().set(&DataKey::SavingGoal(meter_id), &goal);
     }
 
     pub fn register_meter(
@@ -533,7 +633,7 @@ impl UtilityContract {
         reset_claim_window_if_needed(&mut meter, now);
 
         let elapsed = now.saturating_sub(meter.last_update);
-        let effective_rate = get_effective_rate(&meter, now);
+        let effective_rate = get_effective_rate(&env, &meter, now);
         let requested = (elapsed as i128).saturating_mul(effective_rate);
         let claimable = requested
             .min(remaining_claim_capacity(&meter))
@@ -542,7 +642,7 @@ impl UtilityContract {
         if claimable > 0 {
             let provider_window =
                 apply_provider_withdrawal_limit(&env, &meter.provider, claimable);
-            apply_provider_claim(&env, &mut meter, claimable);
+            apply_provider_claim(&env, &mut meter, meter_id, claimable);
             env.storage().instance().set(
                 &DataKey::ProviderWindow(meter.provider.clone()),
                 &provider_window,
@@ -572,7 +672,7 @@ impl UtilityContract {
         let now = env.ledger().timestamp();
         reset_claim_window_if_needed(&mut meter, now);
 
-        let effective_rate = get_effective_rate(&meter, now);
+        let effective_rate = get_effective_rate(&env, &meter, now);
         let cost = units_consumed.saturating_mul(effective_rate);
 
         // Enforce max flow rate hourly cap and available funds
@@ -581,7 +681,7 @@ impl UtilityContract {
             .min(provider_meter_value(&meter));
 
         let was_active = meter.is_active;
-        apply_provider_claim(&env, &mut meter, claimable);
+        apply_provider_claim(&env, &mut meter, meter_id, claimable);
         meter.last_update = now;
         refresh_activity(&mut meter);
 
@@ -605,7 +705,7 @@ impl UtilityContract {
         let now = env.ledger().timestamp();
         reset_claim_window_if_needed(&mut meter, now);
 
-        let effective_rate = get_effective_rate(&meter, now);
+        let effective_rate = get_effective_rate(&env, &meter, now);
         let cost = signed_data.units_consumed.saturating_mul(effective_rate);
 
         // Enforce max flow rate hourly cap and available funds
@@ -614,7 +714,7 @@ impl UtilityContract {
             .min(provider_meter_value(&meter));
 
         let was_active = meter.is_active;
-        apply_provider_claim(&env, &mut meter, claimable);
+        apply_provider_claim(&env, &mut meter, signed_data.meter_id, claimable);
         meter.last_update = now;
         refresh_activity(&mut meter);
 
@@ -699,6 +799,10 @@ impl UtilityContract {
             return precise_watt_hours; // Fallback to avoid division by zero
         }
         precise_watt_hours / precision_factor
+    }
+
+    pub fn get_saving_goal(env: Env, meter_id: u64) -> Option<SavingGoal> {
+        env.storage().instance().get(&DataKey::SavingGoal(meter_id))
     }
 
     pub fn calculate_expected_depletion(env: Env, meter_id: u64) -> Option<u64> {

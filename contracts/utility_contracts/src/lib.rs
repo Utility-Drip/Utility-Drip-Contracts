@@ -89,7 +89,7 @@ pub struct UsageData {
 }
 
 mod gas_estimator;
-use gas_estimator::{GasCostEstimator, LargeScaleCostEstimate};
+use gas_estimator::GasCostEstimator;
 
 #[contracttype]
 #[derive(Clone)]
@@ -2591,7 +2591,7 @@ impl UtilityContract {
             (symbol_short!("PathPay"), meter_id),
             (
                 meter.token,
-                destination_token,
+                destination_token.clone(),
                 amount_usd_cents,
                 withdrawal_amount,
             ),
@@ -2600,7 +2600,7 @@ impl UtilityContract {
         // Issue #107: Cross-Border Settlement Event for Inter-Anchor communication
         env.events().publish(
             (symbol_short!("XBrder"), meter_id),
-            (meter.provider.clone(), destination_token, withdrawal_amount)
+            (meter.provider.clone(), destination_token.clone(), withdrawal_amount)
         );
     }
 
@@ -2894,29 +2894,9 @@ impl UtilityContract {
     pub fn estimate_meter_monthly_cost(
         env: Env,
         is_group_meter: bool,
-        meters_in_group: u32,
+        _meters_in_group: u32,
     ) -> i128 {
-        GasCostEstimator::estimate_meter_monthly_cost(&env, is_group_meter, meters_in_group)
-    }
-
-    pub fn estimate_provider_monthly_cost(
-        env: Env,
-        number_of_meters: u32,
-        percentage_group_meters: f32,
-    ) -> i128 {
-        GasCostEstimator::estimate_provider_monthly_cost(
-            &env,
-            number_of_meters,
-            percentage_group_meters,
-        )
-    }
-
-    pub fn estimate_large_scale_cost(
-        env: Env,
-        number_of_meters: u32,
-        group_billing_enabled: bool,
-    ) -> LargeScaleCostEstimate {
-        GasCostEstimator::estimate_large_scale_cost(&env, number_of_meters, group_billing_enabled)
+        GasCostEstimator::estimate_meter_monthly_cost(&env, is_group_meter, _meters_in_group)
     }
 
     pub fn get_operation_cost(_env: Env, operation: String) -> i128 {
@@ -3837,7 +3817,7 @@ impl UtilityContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::VerifiedProvider(provider), &verified_provider);
+            .set(&DataKey::VerifiedProvider(provider.clone()), &verified_provider);
 
         env.events().publish(
             (soroban_sdk::symbol_short!("VrfReqst"),),
@@ -3927,7 +3907,7 @@ impl UtilityContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::SubDaoConfig(sub_dao), &config);
+            .set(&DataKey::SubDaoConfig(sub_dao.clone()), &config);
 
         env.events().publish(
             (soroban_sdk::symbol_short!("SubDaoC"),),
@@ -4336,7 +4316,7 @@ impl UtilityContract {
             funding_amount,
             is_completed: false,
             completed_at: 0,
-            verified_by: Address::from_contract_id(&BytesN::from_array(&[0; 32])),
+            verified_by: verified_by.clone(),
             completion_proof: Bytes::from_array(&env, &[0; 0]),
         };
 

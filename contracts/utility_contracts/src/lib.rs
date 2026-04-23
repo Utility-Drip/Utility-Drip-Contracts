@@ -284,13 +284,32 @@ pub trait GrantStream {
 // ZK-proof structures for private billing and usage verification
 #[contracttype]
 #[derive(Clone)]
+pub struct Groth16Proof {
+    pub a: Bytes, // G1 point
+    pub b: Bytes, // G2 point
+    pub c: Bytes, // G1 point
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct Groth16VerificationKey {
+    pub alpha_g1: Bytes,
+    pub beta_g2: Bytes,
+    pub gamma_g2: Bytes,
+    pub delta_g2: Bytes,
+    pub ic: Vec<Bytes>, // G1 points
+}
+
+#[contracttype]
+#[derive(Clone)]
 pub struct ZKProof {
-    pub commitment: BytesN<32>,        // Pedersen commitment to usage amount
-    pub nullifier: BytesN<32>,         // Nullifier to prevent double-spending
-    pub proof: Bytes,                  // ZK-SNARK proof (placeholder for future implementation)
-    pub meter_id: u64,                 // Associated meter ID
-    pub timestamp: u64,                // Proof generation timestamp
-    pub is_valid: bool,                // Proof validity status
+    pub commitment: BytesN<32>,
+    pub nullifier: BytesN<32>,
+    pub proof: Groth16Proof,
+    pub public_inputs: Vec<Bytes>, // Serialized field elements
+    pub meter_id: u64,
+    pub timestamp: u64,
+    pub is_valid: bool,
 }
 
 #[contracttype]
@@ -456,7 +475,8 @@ pub enum DataKey {
     PrivateBillingStatus(u64), // meter_id -> PrivateBillingStatus
     CommitmentBatch(u64, u64), // (meter_id, batch_timestamp)
     ZKEnabledMeters, // Set of meters with privacy enabled
-    ZKVerificationCache(BytesN<32>), // proof_hash -> bool (verification result cache)
+    ZKVerificationCache(BytesN<32>), // proof_hash -> bool
+    ZKVerificationKey(u64), // meter_id -> Groth16VerificationKey
     // Issue #130: Grant Stream Integration
     ConservationGoal(u64),
     GrantStreamMatch(u64, Address), // (meter_id, grant_contract)
@@ -975,16 +995,70 @@ pub struct UtilityContract;
 
 // Issue #118: ZK Privacy Helper Functions
 
-/// Placeholder ZK proof verification (for future full ZK-SNARK implementation)
-/// This is a simple mock verification that checks basic constraints
+/// Actual ZK proof verification using Soroban BN254 host functions
+fn verify_groth16_proof(env: &Env, vk: &Groth16VerificationKey, proof: &Groth16Proof, public_inputs: &Vec<Bytes>) -> bool {
+    // 1. Compute L = IC[0] + sum(X[i] * IC[i+1])
+    let mut l = vk.ic.get(0).unwrap();
+    
+    for i in 0..public_inputs.len() {
+        let input = public_inputs.get(i).unwrap();
+        let ic_i = vk.ic.get(i + 1).unwrap();
+        
+        let scaled_ic = env.bn254().g1_mul(&ic_i, &input);
+        l = env.bn254().g1_add(&l, &scaled_ic);
+    }
+    
+    // 2. Prepare pairing check pairs: (A, B), (-alpha, beta), (-L, gamma), (-C, delta)
+    // Format for bn254_pairing_check is a single Bytes object containing concatenated pairs
+    let mut pairs = Bytes::new(&env);
+    
+    // (A, B)
+    pairs.append(&proof.a);
+    pairs.append(&proof.b);
+    
+    // (-alpha, beta)
+    let neg_alpha = negate_g1(env, &vk.alpha_g1);
+    pairs.append(&neg_alpha);
+    pairs.append(&vk.beta_g2);
+    
+    // (-L, gamma)
+    let neg_l = negate_g1(env, &l);
+    pairs.append(&neg_l);
+    pairs.append(&vk.gamma_g2);
+    
+    // (-C, delta)
+    let neg_c = negate_g1(env, &proof.c);
+    pairs.append(&neg_c);
+    pairs.append(&vk.delta_g2);
+    
+    // 3. Pairing check: e(A, B) * e(-alpha, beta) * e(-L, gamma) * e(-C, delta) == 1
+    env.bn254().pairing_check(&pairs)
+}
+
+fn negate_g1(env: &Env, point: &Bytes) -> Bytes {
+    // For BN254 G1, the negation of (x, y) is (x, q - y)
+    // Point is serialized as X (32 bytes) + Y (32 bytes)
+    let x = point.slice(0..32);
+    let y = point.slice(32..64);
+    
+    // q = 21888242871839275222246405745257275088696311157297823662688149467469470860001
+    let q = Bytes::from_slice(env, &[
+        0x30, 0x64, 0x4e, 0x72, 0xe1, 0x31, 0xa0, 0x29, 
+        0xb8, 0x50, 0x45, 0xb6, 0x81, 0x81, 0x58, 0x5d, 
+        0x28, 0x33, 0xe8, 0x48, 0x79, 0xb9, 0x70, 0x91, 
+        0x43, 0xe1, 0xf5, 0x93, 0xf0, 0x00, 0x00, 0x01
+    ]);
+    
+    // Use modular_sub if available, otherwise manual subtraction (careful with underflow)
+    let neg_y = env.crypto().modular_sub(&q, &y, &q);
+    
+    let mut res = Bytes::new(env);
+    res.append(&x);
+    res.append(&neg_y);
+    res
+}
+
 fn verify_zk_proof_placeholder(env: &Env, proof_hash: BytesN<32>) -> bool {
-    let now = env.ledger().timestamp();
-    
-    // Simple validation rules for placeholder implementation:
-    // 1. Proof hash should not be all zeros
-    // 2. Basic timestamp validation (proof should be recent)
-    // 3. In production, this would be full ZK-SNARK verification
-    
     let mut is_non_zero = false;
     for byte in proof_hash.to_array().iter() {
         if *byte != 0 {
@@ -992,9 +1066,6 @@ fn verify_zk_proof_placeholder(env: &Env, proof_hash: BytesN<32>) -> bool {
             break;
         }
     }
-    
-    // For now, accept any non-zero hash as valid (placeholder logic)
-    // In production, this would involve cryptographic verification
     is_non_zero
 }
 
@@ -4659,19 +4730,25 @@ let milestone = MaintenanceMilestone {
         );
     }
 
-    /// Submit ZK usage report with commitment and nullifier
+    /// Set the ZK verification key for a meter
+    pub fn set_zk_verification_key(env: Env, meter_id: u64, vk: Groth16VerificationKey) {
+        let meter = get_meter_or_panic(&env, meter_id);
+        meter.provider.require_auth();
+        env.storage().instance().set(&DataKey::ZKVerificationKey(meter_id), &vk);
+    }
+
+    /// Submit ZK usage report with actual Groth16 proof
     pub fn submit_zk_usage_report(
         env: Env,
         meter_id: u64,
-        commitment: BytesN<32>,
+        proof: Groth16Proof,
+        public_inputs: Vec<Bytes>, // [units_consumed, is_renewable (0/1), commitment, nullifier, ...]
         nullifier: BytesN<32>,
-        encrypted_usage: Bytes,
-        proof_hash: BytesN<32>,
     ) {
-        let meter = get_meter_or_panic(&env, meter_id);
+        let mut meter = get_meter_or_panic(&env, meter_id);
         meter.user.require_auth();
 
-        // Check if privacy mode is enabled
+        // 1. Verify privacy mode
         let privacy_status: PrivateBillingStatus = env.storage()
             .instance()
             .get(&DataKey::PrivateBillingStatus(meter_id))
@@ -4681,46 +4758,118 @@ let milestone = MaintenanceMilestone {
             panic_with_error!(&env, ContractError::PrivacyNotEnabled);
         }
 
-        // Check if nullifier has been used before (prevent double-spending)
+        // 2. Prevent double-spending
         if env.storage().instance().has(&DataKey::NullifierMap(nullifier.clone())) {
             panic_with_error!(&env, ContractError::NullifierAlreadyUsed);
         }
 
-        // Store nullifier to prevent reuse
-        env.storage().instance().set(&DataKey::NullifierMap(nullifier.clone()), &true);
+        // 3. Get Verification Key
+        let vk: Groth16VerificationKey = env.storage().instance().get(&DataKey::ZKVerificationKey(meter_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ZKVerificationFailed));
 
-        // Create and store ZK usage report
-        let zk_report = ZKUsageReport {
-            commitment: commitment.clone(),
-            nullifier: nullifier.clone(),
-            encrypted_usage,
-            proof_hash,
-            meter_id,
-            billing_cycle: privacy_status.billing_cycle,
-            timestamp: env.ledger().timestamp(),
-            is_verified: false,
+        // 4. Verify Proof
+        if !verify_groth16_proof(&env, &vk, &proof, &public_inputs) {
+            panic_with_error!(&env, ContractError::InvalidZKProof);
+        }
+
+        // 5. Extract amount and flags from public inputs
+        let units_bytes = public_inputs.get(0).unwrap();
+        let mut units_arr = [0u8; 16];
+        units_bytes.copy_into_slice(&mut units_arr);
+        let units_consumed: i128 = i128::from_be_bytes(units_arr);
+
+        let is_renewable_bytes = public_inputs.get(1).unwrap();
+        let is_renewable = is_renewable_bytes.get(is_renewable_bytes.len() - 1).unwrap_or(0) != 0;
+
+        if units_consumed < 0 || units_consumed > MAX_USAGE_PER_UPDATE {
+            panic_with_error!(&env, ContractError::InvalidUsageValue);
+        }
+
+        // 6. Apply billing logic (similar to deduct_units)
+        let old_meter_value = provider_meter_value(&meter);
+        let now = env.ledger().timestamp();
+        let effective_rate = get_effective_rate(&env, &meter, now);
+
+        let discounted_rate = if is_renewable && meter.green_energy_discount_bps > 0 {
+            effective_rate.saturating_mul(10000 - meter.green_energy_discount_bps) / 10000
+        } else {
+            effective_rate
         };
 
-        env.storage().instance().set(&DataKey::ZKUsageReport(meter_id, privacy_status.billing_cycle), &zk_report);
+        let cost = units_consumed.saturating_mul(discounted_rate);
 
-        // Store commitment
-        env.storage().instance().set(&DataKey::ZKProof(commitment.clone()), &ZKProof {
-            commitment: commitment.clone(),
-            nullifier: nullifier.clone(),
-            proof: Bytes::new(&env),
-            meter_id,
-            timestamp: env.ledger().timestamp(),
-            is_valid: false,
-        });
+        // Withdrawal limits
+        apply_provider_withdrawal_limit(&env, &meter.provider, cost);
 
-        // Update billing status
-        let mut updated_status = privacy_status.clone();
+        // Maintenance fund
+        allocate_to_maintenance_fund(&env, meter_id, cost);
+
+        // Tax
+        let tax_rate_bps = env.storage().instance().get(&DataKey::TaxRateBps).unwrap_or(DEFAULT_TAX_RATE_BPS);
+        let tax_amount = (cost * tax_rate_bps) / 10000;
+        let after_tax = cost - tax_amount;
+
+        if tax_amount > 0 {
+            if let Some(gov_vault) = env.storage().instance().get::<_, Address>(&DataKey::GovernmentVault) {
+                let client = token::Client::new(&env, &meter.token);
+                client.transfer(&env.current_contract_address(), &gov_vault, &tax_amount);
+            }
+        }
+
+        // Protocol & Reseller fees (simplified for ZK flow, using after_tax)
+        let protocol_bps: i128 = env.storage().instance().get(&DataKey::ProtocolFeeBps).unwrap_or(0);
+        let protocol_fee = (after_tax * protocol_bps) / 10000;
+        let after_protocol = after_tax - protocol_fee;
+
+        if protocol_fee > 0 {
+            if let Some(wallet) = env.storage().instance().get::<_, Address>(&DataKey::MaintenanceWallet) {
+                let client = token::Client::new(&env, &meter.token);
+                client.transfer(&env.current_contract_address(), &wallet, &protocol_fee);
+            }
+        }
+
+        let reseller_payout = get_reseller_cut(&env, meter_id, after_protocol);
+        let provider_payout = after_protocol - reseller_payout;
+
+        if reseller_payout > 0 {
+            if let Some(reseller_config) = get_reseller_config_impl(&env, meter_id) {
+                let client = token::Client::new(&env, &meter.token);
+                client.transfer(&env.current_contract_address(), &reseller_config.reseller, &reseller_payout);
+            }
+        }
+
+        if provider_payout > 0 {
+            let client = token::Client::new(&env, &meter.token);
+            client.transfer(&env.current_contract_address(), &meter.provider, &provider_payout);
+        }
+
+        // Deduct from balance
+        match meter.billing_type {
+            BillingType::PrePaid => meter.balance = meter.balance.saturating_sub(cost),
+            BillingType::PostPaid => meter.debt = meter.debt.saturating_add(cost),
+        }
+
+        meter.usage_data.total_watt_hours = meter.usage_data.total_watt_hours.saturating_add(units_consumed);
+        if is_renewable {
+            meter.usage_data.renewable_watt_hours = meter.usage_data.renewable_watt_hours.saturating_add(units_consumed);
+        }
+        meter.last_update = now;
+
+        // 7. Record success
+        env.storage().instance().set(&DataKey::NullifierMap(nullifier.clone()), &true);
+        
+        let mut updated_status = privacy_status;
         updated_status.total_commitments += 1;
+        updated_status.verified_proofs += 1;
+        updated_status.last_verification = now;
         env.storage().instance().set(&DataKey::PrivateBillingStatus(meter_id), &updated_status);
 
+        update_provider_total_pool(&env, &meter.provider, old_meter_value, provider_meter_value(&meter));
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+
         env.events().publish(
-            (symbol_short!("ZKReport"), meter_id),
-            (commitment, privacy_status.billing_cycle),
+            (symbol_short!("ZKUsage"), meter_id),
+            (units_consumed, cost),
         );
     }
 
@@ -4770,44 +4919,12 @@ let milestone = MaintenanceMilestone {
         }
     }
 
-    /// Verify ZK proof (placeholder for future full ZK implementation)
-    pub fn verify_zk_proof(env: Env, meter_id: u64, proof_hash: BytesN<32>) -> bool {
-        // Check if meter has privacy enabled
-        let privacy_status: PrivateBillingStatus = env.storage()
-            .instance()
-            .get(&DataKey::PrivateBillingStatus(meter_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::PrivacyNotEnabled));
+    /// Verify ZK proof explicitly
+    pub fn verify_zk_proof(env: Env, meter_id: u64, proof: Groth16Proof, public_inputs: Vec<Bytes>) -> bool {
+        let vk: Groth16VerificationKey = env.storage().instance().get(&DataKey::ZKVerificationKey(meter_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ZKVerificationFailed));
 
-        if !privacy_status.privacy_enabled {
-            panic_with_error!(&env, ContractError::PrivacyNotEnabled);
-        }
-
-        // Check verification cache first
-        if let Some(cached_result) = env.storage().instance().get::<_, bool>(&DataKey::ZKVerificationCache(proof_hash)) {
-            return cached_result;
-        }
-
-        // For now, implement a simple verification (placeholder for full ZK-SNARK)
-        // In production, this would verify the actual ZK proof
-        let is_valid = verify_zk_proof_placeholder(&env, proof_hash);
-
-        // Cache the result
-        env.storage().instance().set(&DataKey::ZKVerificationCache(proof_hash), &is_valid);
-
-        if is_valid {
-            // Update verified proofs count
-            let mut updated_status = privacy_status;
-            updated_status.verified_proofs += 1;
-            updated_status.last_verification = env.ledger().timestamp();
-            env.storage().instance().set(&DataKey::PrivateBillingStatus(meter_id), &updated_status);
-
-            env.events().publish(
-                (symbol_short!("ZKVerif"), meter_id),
-                proof_hash,
-            );
-        }
-
-        is_valid
+        verify_groth16_proof(&env, &vk, &proof, &public_inputs)
     }
 
     /// Get private billing status for a meter
@@ -4865,3 +4982,5 @@ fn verify_usage_signature(
 }
 
 mod test;
+#[cfg(test)]
+mod zk_tests;

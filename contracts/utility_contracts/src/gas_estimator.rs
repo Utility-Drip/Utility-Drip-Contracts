@@ -15,6 +15,8 @@ impl GasCostEstimator {
     const UPDATE_HEARTBEAT: i128 = 3_000_000; // 0.03 XLM
     const GROUP_TOP_UP_PER_METER: i128 = 6_000_000; // 0.06 XLM per meter
     const EMERGENCY_SHUTDOWN: i128 = 2_000_000; // 0.02 XLM
+    const SUBMIT_ZK_REPORT: i128 = 50_000_000; // 0.5 XLM (includes pairing check)
+    const SET_ZK_VK: i128 = 15_000_000; // 0.15 XLM
 
     // Estimated monthly operations per meter
     const CLAIMS_PER_MONTH: u32 = 30;
@@ -112,6 +114,12 @@ impl GasCostEstimator {
         }
         if *operation == soroban_sdk::String::from_str(&soroban_sdk::Env::default(), "emergency_shutdown") {
             return Self::EMERGENCY_SHUTDOWN;
+        }
+        if *operation == soroban_sdk::String::from_str(&soroban_sdk::Env::default(), "submit_zk_usage_report") {
+            return Self::SUBMIT_ZK_REPORT;
+        }
+        if *operation == soroban_sdk::String::from_str(&soroban_sdk::Env::default(), "set_zk_verification_key") {
+            return Self::SET_ZK_VK;
         }
         0
     }

@@ -134,6 +134,7 @@ program
   .option('-i, --interval <seconds>', 'Reporting interval in seconds', '30')
   .option('-m, --mode <mode>', 'Simulation mode (realistic/surge/low)', 'realistic')
   .option('--mqtt', 'Use MQTT for publishing (default: direct contract calls)')
+  .option('--zk', 'Enable Zero-Knowledge privacy mode')
   .action(async (options) => {
     try {
       console.log(chalk.blue('🚀 Starting meter simulation...'));
@@ -157,12 +158,16 @@ program
       
       const interval = setInterval(async () => {
         try {
-          const usageData = device.generateUsageData(options.mode);
-          
-          if (publisher) {
+          if (options.mqtt) {
+            const usageData = device.generateUsageData(options.mode);
             await publisher.publishUsageData(usageData);
             console.log(chalk.green(`📡 Published usage: ${usageData.watt_hours_consumed}Wh, ${usageData.units_consumed} units`));
+          } else if (options.zk) {
+            const zkData = device.generateZkUsageData(options.mode);
+            await contract.submitZkUsageData(zkData);
+            console.log(chalk.green(`🛡️  Submitted ZK Privacy Report: ${zkData.units_consumed} units (Verified via Groth16)`));
           } else {
+            const usageData = device.generateUsageData(options.mode);
             await contract.submitUsageData(usageData);
             console.log(chalk.green(`📤 Submitted usage: ${usageData.watt_hours_consumed}Wh, ${usageData.units_consumed} units`));
           }

@@ -162,6 +162,7 @@ fn test_debt_calculation_underflow_protection() {
         units_consumed: 10_000_000i128,           // 10 million units
         signature: BytesN::from_array(&env, &[3u8; 64]),
         public_key: device_public_key.clone(),
+        is_renewable_energy: false,
     };
 
     // This should not panic even with extreme values
@@ -203,6 +204,7 @@ fn test_debt_calculation_underflow_protection() {
         units_consumed: i128::MAX / 1_000_000_000,  // Safe maximum
         signature: BytesN::from_array(&env, &[4u8; 64]),
         public_key: device_public_key.clone(),
+        is_renewable_energy: false,
     };
 
     // Should handle maximum values without panicking
@@ -256,6 +258,7 @@ fn test_prepaid_negative_balance_handling() {
         units_consumed: 100_000i128,
         signature: BytesN::from_array(&env, &[3u8; 64]),
         public_key: device_public_key.clone(),
+        is_renewable_energy: false,
     };
 
     // This should not panic, even with zero balance

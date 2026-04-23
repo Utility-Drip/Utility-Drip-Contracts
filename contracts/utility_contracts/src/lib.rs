@@ -35,6 +35,27 @@ pub enum BillingType {
     PrePaid,
     PostPaid,
 }
+
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum StreamStatus {
+    Active = 0,
+    Paused = 1,
+    Depleted = 2,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContinuousFlow {
+    // Tightly packed struct for optimal storage
+    pub stream_id: u64,           // 8 bytes
+    pub flow_rate_per_second: i128, // 16 bytes - micro-stroops per second
+    pub accumulated_balance: i128,  // 16 bytes - precise balance tracking
+    pub last_flow_timestamp: u64,   // 8 bytes - u64 for epoch safety
+    pub created_timestamp: u64,     // 8 bytes - creation time
+    pub status: StreamStatus,       // 1 byte (enum)
+    pub reserved: [u8; 7],         // 7 bytes - for future use/alignment
+}
 // Minimum balance required to keep the IoT relay open (500 tokens for testing)
 const MINIMUM_BALANCE_TO_FLOW: i128 = 500; // 500 tokens minimum for testing
 
@@ -121,6 +142,17 @@ pub struct BatchCreatedEvent {
 }
 
 #[contracttype]
+#[derive(Clone)]
+pub struct StreamUpdatedEvent {
+    pub stream_id: u64,
+    pub old_flow_rate: i128,
+    pub new_flow_rate: i128,
+    pub timestamp: u64,
+    pub old_status: StreamStatus,
+    pub new_status: StreamStatus,
+}
+
+#[contracttype]
 pub enum DataKey {
     Meter(u64),
     ProviderWindow(Address),
@@ -131,6 +163,7 @@ pub enum DataKey {
     ProtocolFeeBps,
     SupportedToken(Address),
     ProviderTotalPool(Address),
+    ContinuousFlow(u64),
 }
 
 #[contracterror]
@@ -477,6 +510,212 @@ fn publish_active_event(env: &Env, meter_id: u64, now: u64) {
 fn publish_inactive_event(env: &Env, meter_id: u64, now: u64) {
     env.events()
         .publish((symbol_short!("Inactive"), meter_id), now);
+}
+
+// Continuous Flow Math Engine Functions
+
+/// Create a new continuous flow stream with timestamp-based tracking
+fn create_continuous_flow(
+    stream_id: u64,
+    flow_rate_per_second: i128,
+    initial_balance: i128,
+    current_timestamp: u64,
+) -> ContinuousFlow {
+    ContinuousFlow {
+        stream_id,
+        flow_rate_per_second,
+        accumulated_balance: initial_balance,
+        last_flow_timestamp: current_timestamp,
+        created_timestamp: current_timestamp,
+        status: if initial_balance > 0 { StreamStatus::Active } else { StreamStatus::Paused },
+        reserved: [0u8; 7],
+    }
+}
+
+/// Calculate flow accumulation since last update with precise timestamp math
+fn calculate_flow_accumulation(
+    flow: &ContinuousFlow,
+    current_timestamp: u64,
+) -> i128 {
+    if flow.status != StreamStatus::Active {
+        return 0;
+    }
+
+    // Prevent underflow with checked subtraction
+    let elapsed_seconds = match current_timestamp.checked_sub(flow.last_flow_timestamp) {
+        Some(elapsed) => elapsed,
+        None => return 0, // Timestamp went backwards, no accumulation
+    };
+
+    // Use i128 for precise calculation to prevent overflow
+    let elapsed_i128 = elapsed_seconds as i128;
+    
+    // Calculate accumulated flow: rate * time
+    // flow_rate_per_second is in micro-stroops per second
+    let accumulated = flow.flow_rate_per_second.saturating_mul(elapsed_i128);
+    
+    accumulated
+}
+
+/// Update flow with new timestamp and handle underflow risks
+fn update_continuous_flow(
+    flow: &mut ContinuousFlow,
+    current_timestamp: u64,
+) -> Result<i128, ContractError> {
+    let accumulation = calculate_flow_accumulation(flow, current_timestamp);
+    
+    // Handle underflow: ensure we don't go below zero balance
+    if flow.accumulated_balance < accumulation {
+        // Deplete the balance and set status to Depleted
+        let actual_deduction = flow.accumulated_balance;
+        flow.accumulated_balance = 0;
+        flow.status = StreamStatus::Depleted;
+        flow.last_flow_timestamp = current_timestamp;
+        return Ok(actual_deduction);
+    }
+    
+    // Normal case: deduct accumulation from balance
+    flow.accumulated_balance = flow.accumulated_balance.saturating_sub(accumulation);
+    flow.last_flow_timestamp = current_timestamp;
+    
+    // Update status based on remaining balance
+    if flow.accumulated_balance == 0 {
+        flow.status = StreamStatus::Depleted;
+    } else if flow.status == StreamStatus::Paused && flow.accumulated_balance > 0 {
+        flow.status = StreamStatus::Active;
+    }
+    
+    Ok(accumulation)
+}
+
+/// Update flow rate with authentication and event emission
+fn update_flow_rate(
+    env: &Env,
+    stream_id: u64,
+    new_flow_rate: i128,
+) -> Result<(), ContractError> {
+    let mut flow = get_continuous_flow_or_panic(env, stream_id);
+    
+    // Require authentication for flow rate changes
+    env.current_contract_address().require_auth();
+    
+    let old_flow_rate = flow.flow_rate_per_second;
+    let old_status = flow.status;
+    
+    flow.flow_rate_per_second = new_flow_rate;
+    
+    // Update status based on new flow rate and balance
+    if new_flow_rate == 0 {
+        flow.status = StreamStatus::Paused;
+    } else if flow.accumulated_balance > 0 && flow.status == StreamStatus::Paused {
+        flow.status = StreamStatus::Active;
+    }
+    
+    // Update timestamp to current time
+    let current_timestamp = env.ledger().timestamp();
+    
+    // Emit detailed StreamUpdated event
+    let event = StreamUpdatedEvent {
+        stream_id,
+        old_flow_rate,
+        new_flow_rate,
+        timestamp: current_timestamp,
+        old_status,
+        new_status: flow.status,
+    };
+    
+    env.events().publish(
+        symbol_short!("StreamUpdated"),
+        (stream_id, old_flow_rate, new_flow_rate, current_timestamp, old_status as u32, flow.status as u32)
+    );
+    
+    // Store updated flow
+    env.storage()
+        .instance()
+        .set(&DataKey::ContinuousFlow(stream_id), &flow);
+    
+    Ok(())
+}
+
+/// Get continuous flow or panic if not found
+fn get_continuous_flow_or_panic(env: &Env, stream_id: u64) -> ContinuousFlow {
+    match env
+        .storage()
+        .instance()
+        .get::<DataKey, ContinuousFlow>(&DataKey::ContinuousFlow(stream_id))
+    {
+        Some(flow) => flow,
+        None => panic_with_error!(env, ContractError::MeterNotFound), // Reuse existing error
+    }
+}
+
+/// Add balance to continuous flow with underflow protection
+fn add_balance_to_flow(
+    env: &Env,
+    stream_id: u64,
+    additional_balance: i128,
+) -> Result<(), ContractError> {
+    if additional_balance <= 0 {
+        return Err(ContractError::InvalidTokenAmount);
+    }
+    
+    let mut flow = get_continuous_flow_or_panic(env, stream_id);
+    
+    // Update flow calculation first
+    let current_timestamp = env.ledger().timestamp();
+    update_continuous_flow(&mut flow, current_timestamp)?;
+    
+    // Add new balance with overflow protection
+    flow.accumulated_balance = flow.accumulated_balance.saturating_add(additional_balance);
+    
+    // Update status if needed
+    if flow.accumulated_balance > 0 && flow.flow_rate_per_second > 0 {
+        flow.status = StreamStatus::Active;
+    }
+    
+    // Store updated flow
+    env.storage()
+        .instance()
+        .set(&DataKey::ContinuousFlow(stream_id), &flow);
+    
+    Ok(())
+}
+
+/// Withdraw from continuous flow with high-frequency safety
+fn withdraw_from_flow(
+    env: &Env,
+    stream_id: u64,
+    withdrawal_amount: i128,
+) -> Result<i128, ContractError> {
+    if withdrawal_amount <= 0 {
+        return Err(ContractError::InvalidTokenAmount);
+    }
+    
+    let mut flow = get_continuous_flow_or_panic(env, stream_id);
+    
+    // Update flow calculation first
+    let current_timestamp = env.ledger().timestamp();
+    update_continuous_flow(&mut flow, current_timestamp)?;
+    
+    // Check if sufficient balance available
+    if flow.accumulated_balance < withdrawal_amount {
+        return Err(ContractError::InvalidTokenAmount);
+    }
+    
+    // Perform withdrawal
+    flow.accumulated_balance = flow.accumulated_balance.saturating_sub(withdrawal_amount);
+    
+    // Update status if depleted
+    if flow.accumulated_balance == 0 {
+        flow.status = StreamStatus::Depleted;
+    }
+    
+    // Store updated flow
+    env.storage()
+        .instance()
+        .set(&DataKey::ContinuousFlow(stream_id), &flow);
+    
+    Ok(withdrawal_amount)
 }
 
 #[contractimpl]
@@ -1280,6 +1519,127 @@ impl UtilityContract {
 
         env.events()
             .publish((symbol_short!("Transfer"), meter_id), (old_user, new_user));
+    }
+
+    // Continuous Flow Engine Public Interface
+
+    /// Create a new continuous flow stream
+    pub fn create_continuous_stream(
+        env: Env,
+        stream_id: u64,
+        flow_rate_per_second: i128,
+        initial_balance: i128,
+    ) {
+        env.current_contract_address().require_auth();
+        
+        if flow_rate_per_second < 0 || initial_balance < 0 {
+            panic_with_error!(&env, ContractError::InvalidTokenAmount);
+        }
+        
+        let current_timestamp = env.ledger().timestamp();
+        let flow = create_continuous_flow(stream_id, flow_rate_per_second, initial_balance, current_timestamp);
+        
+        env.storage()
+            .instance()
+            .set(&DataKey::ContinuousFlow(stream_id), &flow);
+        
+        env.events().publish(
+            symbol_short!("StreamCreated"),
+            (stream_id, flow_rate_per_second, initial_balance, current_timestamp)
+        );
+    }
+
+    /// Update the flow rate of an existing continuous stream
+    pub fn update_continuous_flow_rate(env: Env, stream_id: u64, new_flow_rate: i128) {
+        if new_flow_rate < 0 {
+            panic_with_error!(&env, ContractError::InvalidTokenAmount);
+        }
+        
+        update_flow_rate(&env, stream_id, new_flow_rate).unwrap();
+    }
+
+    /// Add balance to a continuous flow stream
+    pub fn add_continuous_balance(env: Env, stream_id: u64, additional_balance: i128) {
+        add_balance_to_flow(&env, stream_id, additional_balance).unwrap();
+        
+        env.events().publish(
+            symbol_short!("BalanceAdded"),
+            (stream_id, additional_balance)
+        );
+    }
+
+    /// Withdraw from a continuous flow stream
+    pub fn withdraw_continuous(env: Env, stream_id: u64, withdrawal_amount: i128) -> i128 {
+        let withdrawn = withdraw_from_flow(&env, stream_id, withdrawal_amount).unwrap();
+        
+        env.events().publish(
+            symbol_short!("Withdrawal"),
+            (stream_id, withdrawn)
+        );
+        
+        withdrawn
+    }
+
+    /// Get the current state of a continuous flow stream
+    pub fn get_continuous_flow(env: Env, stream_id: u64) -> Option<ContinuousFlow> {
+        env.storage()
+            .instance()
+            .get::<DataKey, ContinuousFlow>(&DataKey::ContinuousFlow(stream_id))
+    }
+
+    /// Calculate expected depletion time for a continuous flow stream
+    pub fn calculate_continuous_depletion(env: Env, stream_id: u64) -> Option<u64> {
+        if let Some(flow) = env.storage()
+            .instance()
+            .get::<DataKey, ContinuousFlow>(&DataKey::ContinuousFlow(stream_id))
+        {
+            if flow.status != StreamStatus::Active || flow.flow_rate_per_second <= 0 {
+                return None;
+            }
+            
+            let current_timestamp = env.ledger().timestamp();
+            let accumulation = calculate_flow_accumulation(&flow, current_timestamp);
+            let remaining_balance = flow.accumulated_balance.saturating_sub(accumulation);
+            
+            if remaining_balance <= 0 {
+                return Some(current_timestamp);
+            }
+            
+            let seconds_until_depletion = remaining_balance / flow.flow_rate_per_second;
+            Some(current_timestamp + seconds_until_depletion as u64)
+        } else {
+            None
+        }
+    }
+
+    /// Pause a continuous flow stream
+    pub fn pause_continuous_flow(env: Env, stream_id: u64) {
+        update_flow_rate(&env, stream_id, 0).unwrap();
+    }
+
+    /// Resume a continuous flow stream with specified rate
+    pub fn resume_continuous_flow(env: Env, stream_id: u64, flow_rate_per_second: i128) {
+        if flow_rate_per_second <= 0 {
+            panic_with_error!(&env, ContractError::InvalidTokenAmount);
+        }
+        
+        update_flow_rate(&env, stream_id, flow_rate_per_second).unwrap();
+    }
+
+    /// Get the current accumulated balance after flow calculation
+    pub fn get_continuous_balance(env: Env, stream_id: u64) -> Option<i128> {
+        if let Some(mut flow) = env.storage()
+            .instance()
+            .get::<DataKey, ContinuousFlow>(&DataKey::ContinuousFlow(stream_id))
+        {
+            let current_timestamp = env.ledger().timestamp();
+            let accumulation = calculate_flow_accumulation(&flow, current_timestamp);
+            let remaining_balance = flow.accumulated_balance.saturating_sub(accumulation);
+            
+            Some(remaining_balance)
+        } else {
+            None
+        }
     }
 }
 

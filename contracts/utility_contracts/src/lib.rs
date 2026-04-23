@@ -28,6 +28,10 @@ pub struct PriceData {
 mod debt_fuzz_tests;
 #[cfg(test)]
 mod fuzz_tests;
+#[cfg(test)]
+mod dust_sweeper_tests;
+#[cfg(test)]
+mod dust_sweeper_basic_tests;
 
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -153,6 +157,24 @@ pub struct StreamUpdatedEvent {
 }
 
 #[contracttype]
+#[derive(Clone)]
+pub struct DustCollectedEvent {
+    pub token_address: Address,
+    pub total_dust_swept: i128,
+    pub streams_swept: u64,
+    pub timestamp: u64,
+    pub sweeper_address: Address,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct DustAggregation {
+    pub total_dust: i128,
+    pub stream_count: u64,
+    pub last_updated: u64,
+}
+
+#[contracttype]
 pub enum DataKey {
     Meter(u64),
     ProviderWindow(Address),
@@ -164,6 +186,9 @@ pub enum DataKey {
     SupportedToken(Address),
     ProviderTotalPool(Address),
     ContinuousFlow(u64),
+    DustAggregation(Address),
+    AdminAddress,
+    GasBountyPool,
 }
 
 #[contracterror]
@@ -185,6 +210,9 @@ pub enum ContractError {
     ChallengeNotFound = 13,
     InvalidPairingSignature = 14,
     MeterNotPaired = 15,
+    UnauthorizedAdmin = 16,
+    InsufficientGasBounty = 17,
+    NoDustToSweep = 18,
 }
 
 #[contracttype]
@@ -216,6 +244,11 @@ const RATE_PRECISION: i128 = 2; // Precision for rate calculations
 // XLM precision constants - XLM has 7 decimal places (0.0000001 minimum)
 const XLM_PRECISION: i128 = 10_000_000; // 10^7 for 7 decimal places
 const XLM_MINIMUM_INCREMENT: i128 = 1; // 1 stroop = 0.0000001 XLM
+
+// Dust detection constants
+const DUST_THRESHOLD: i128 = 1; // Less than 1 stroop is considered dust
+const GAS_BOUNTY_AMOUNT: i128 = 100_000; // 0.01 XLM bounty for dust sweepers
+const MAX_SWEEP_STREAMS_PER_CALL: u64 = 1000; // Prevent gas limit issues
 
 /// Round XLM amount to nearest minimum increment (0.0000001 XLM)
 /// This prevents value loss over time due to truncation
@@ -281,6 +314,53 @@ fn transfer_tokens(
 fn get_token_balance(env: &Env, token_address: &Address, account: &Address) -> i128 {
     let client = token::Client::new(env, token_address);
     client.balance(account)
+}
+
+/// Check if a balance amount qualifies as dust (less than 1 stroop)
+fn is_dust_amount(amount: i128) -> bool {
+    amount > 0 && amount < XLM_MINIMUM_INCREMENT
+}
+
+/// Get admin address or panic if not set
+fn get_admin_or_panic(env: &Env) -> Address {
+    match env
+        .storage()
+        .instance()
+        .get::<DataKey, Address>(&DataKey::AdminAddress)
+    {
+        Some(admin) => admin,
+        None => panic_with_error!(env, ContractError::UnauthorizedAdmin),
+    }
+}
+
+/// Check if caller is authorized admin
+fn require_admin_auth(env: &Env) {
+    let admin = get_admin_or_panic(env);
+    admin.require_auth();
+}
+
+/// Get or create dust aggregation for a specific token
+fn get_or_create_dust_aggregation(env: &Env, token_address: &Address) -> DustAggregation {
+    env.storage()
+        .instance()
+        .get::<DataKey, DustAggregation>(&DataKey::DustAggregation(token_address.clone()))
+        .unwrap_or(DustAggregation {
+            total_dust: 0,
+            stream_count: 0,
+            last_updated: env.ledger().timestamp(),
+        })
+}
+
+/// Update dust aggregation for a token
+fn update_dust_aggregation(env: &Env, token_address: &Address, dust_amount: i128, stream_count_delta: u64) {
+    let mut aggregation = get_or_create_dust_aggregation(env, token_address);
+    aggregation.total_dust = aggregation.total_dust.saturating_add(dust_amount);
+    aggregation.stream_count = aggregation.stream_count.saturating_add(stream_count_delta);
+    aggregation.last_updated = env.ledger().timestamp();
+    
+    env.storage()
+        .instance()
+        .set(&DataKey::DustAggregation(token_address.clone()), &aggregation);
 }
 
 fn get_meter_or_panic(env: &Env, meter_id: u64) -> Meter {
@@ -738,6 +818,37 @@ impl UtilityContract {
         env.storage()
             .instance()
             .set(&DataKey::ProtocolFeeBps, &fee_bps);
+    }
+
+    /// Set admin address for dust sweeper authorization
+    pub fn set_admin(env: Env, admin_address: Address) {
+        env.current_contract_address().require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminAddress, &admin_address);
+    }
+
+    /// Add funds to gas bounty pool for dust sweepers
+    pub fn fund_gas_bounty(env: Env, amount: i128) {
+        require_admin_auth(&env);
+        
+        if amount <= 0 {
+            panic_with_error!(&env, ContractError::InvalidTokenAmount);
+        }
+
+        let current_bounty = env
+            .storage()
+            .instance()
+            .get::<DataKey, i128>(&DataKey::GasBountyPool)
+            .unwrap_or(0);
+        
+        let updated_bounty = current_bounty.saturating_add(amount);
+        env.storage()
+            .instance()
+            .set(&DataKey::GasBountyPool, &updated_bounty);
+
+        env.events()
+            .publish(symbol_short!("BountyFunded"), amount);
     }
 
     pub fn add_supported_token(env: Env, token: Address) {
@@ -1639,6 +1750,143 @@ impl UtilityContract {
             Some(remaining_balance)
         } else {
             None
+        }
+    }
+
+    /// Sweep dust from depleted continuous flow streams
+    /// Only works on streams with < 1 stroop balance that are depleted or paused
+    /// Requires admin auth or sufficient gas bounty
+    pub fn sweep_dust(env: Env, token_address: Address, max_streams: Option<u64>) -> DustCollectedEvent {
+        let caller = env.invoker(); // Use invoker() instead of current_contract_address()
+        let is_admin = {
+            match env.storage().instance().get::<DataKey, Address>(&DataKey::AdminAddress) {
+                Some(admin) => admin == caller,
+                None => false,
+            }
+        };
+
+        if !is_admin {
+            let bounty_pool = env
+                .storage()
+                .instance()
+                .get::<DataKey, i128>(&DataKey::GasBountyPool)
+                .unwrap_or(0);
+            
+            if bounty_pool < GAS_BOUNTY_AMOUNT {
+                panic_with_error!(&env, ContractError::InsufficientGasBounty);
+            }
+            
+            // Non-admin callers need to authenticate themselves
+            caller.require_auth();
+        }
+
+        let max_to_process = max_streams.unwrap_or(MAX_SWEEP_STREAMS_PER_CALL).min(MAX_SWEEP_STREAMS_PER_CALL);
+        let mut total_dust_swept = 0i128;
+        let mut streams_swept = 0u64;
+        let current_timestamp = env.ledger().timestamp();
+
+        let total_streams = env
+            .storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::Count)
+            .unwrap_or(0);
+
+        for stream_id in 1..=total_streams.min(max_to_process) {
+            if let Some(mut flow) = env.storage()
+                .instance()
+                .get::<DataKey, ContinuousFlow>(&DataKey::ContinuousFlow(stream_id))
+            {
+                // Update flow calculation first
+                let accumulation = calculate_flow_accumulation(&flow, current_timestamp);
+                let current_balance = flow.accumulated_balance.saturating_sub(accumulation);
+                
+                // Check if stream qualifies for dust sweeping
+                if (flow.status == StreamStatus::Depleted || flow.status == StreamStatus::Paused) 
+                    && is_dust_amount(current_balance) {
+                    
+                    total_dust_swept = total_dust_swept.saturating_add(current_balance);
+                    streams_swept += 1;
+                    
+                    // Clear the dust from the stream
+                    flow.accumulated_balance = 0;
+                    flow.last_flow_timestamp = current_timestamp;
+                    
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::ContinuousFlow(stream_id), &flow);
+                }
+            }
+        }
+
+        if total_dust_swept == 0 {
+            panic_with_error!(&env, ContractError::NoDustToSweep);
+        }
+
+        // Transfer dust to protocol treasury (maintenance wallet)
+        if let Some(treasury) = env.storage().instance().get::<DataKey, Address>(&DataKey::MaintenanceWallet) {
+            transfer_tokens(&env, &token_address, &env.current_contract_address(), &treasury, &total_dust_swept);
+        }
+
+        // Update dust aggregation
+        update_dust_aggregation(&env, &token_address, total_dust_swept, streams_swept);
+
+        // Pay gas bounty if not admin
+        if !is_admin {
+            let current_bounty = env
+                .storage()
+                .instance()
+                .get::<DataKey, i128>(&DataKey::GasBountyPool)
+                .unwrap_or(0);
+            
+            let updated_bounty = current_bounty.saturating_sub(GAS_BOUNTY_AMOUNT);
+            env.storage()
+                .instance()
+                .set(&DataKey::GasBountyPool, &updated_bounty);
+
+            transfer_tokens(&env, &token_address, &env.current_contract_address(), &caller, &GAS_BOUNTY_AMOUNT);
+        }
+
+        let event = DustCollectedEvent {
+            token_address: token_address.clone(),
+            total_dust_swept,
+            streams_swept,
+            timestamp: current_timestamp,
+            sweeper_address: caller,
+        };
+
+        env.events()
+            .publish(symbol_short!("DustCollected"), (
+                token_address,
+                total_dust_swept,
+                streams_swept,
+                current_timestamp,
+                caller
+            ));
+
+        event
+    }
+
+    /// Get dust aggregation data for a specific token
+    pub fn get_dust_aggregation(env: Env, token_address: Address) -> Option<DustAggregation> {
+        env.storage()
+            .instance()
+            .get::<DataKey, DustAggregation>(&DataKey::DustAggregation(token_address))
+    }
+
+    /// Check if a specific stream has dust balance
+    pub fn has_dust(env: Env, stream_id: u64) -> bool {
+        if let Some(flow) = env.storage()
+            .instance()
+            .get::<DataKey, ContinuousFlow>(&DataKey::ContinuousFlow(stream_id))
+        {
+            let current_timestamp = env.ledger().timestamp();
+            let accumulation = calculate_flow_accumulation(&flow, current_timestamp);
+            let current_balance = flow.accumulated_balance.saturating_sub(accumulation);
+            
+            (flow.status == StreamStatus::Depleted || flow.status == StreamStatus::Paused) 
+                && is_dust_amount(current_balance)
+        } else {
+            false
         }
     }
 }

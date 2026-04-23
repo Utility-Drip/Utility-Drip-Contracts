@@ -35,7 +35,53 @@ const MAX_FINANCE_WALLETS: usize = 5;
 
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum BillingType { PrePaid, PostPaid }
+pub enum BillingType {
+    PrePaid,
+    PostPaid,
+}
+
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum StreamStatus {
+    Active = 0,
+    Paused = 1,
+    Depleted = 2,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContinuousFlow {
+    // Tightly packed struct for optimal storage
+    pub stream_id: u64,           // 8 bytes
+    pub flow_rate_per_second: i128, // 16 bytes - micro-stroops per second
+    pub accumulated_balance: i128,  // 16 bytes - precise balance tracking
+    pub last_flow_timestamp: u64,   // 8 bytes - u64 for epoch safety
+    pub created_timestamp: u64,     // 8 bytes - creation time
+    pub status: StreamStatus,       // 1 byte (enum)
+    pub reserved: [u8; 7],         // 7 bytes - for future use/alignment
+}
+// Minimum balance required to keep the IoT relay open (500 tokens for testing)
+const MINIMUM_BALANCE_TO_FLOW: i128 = 500; // 500 tokens minimum for testing
+
+#[contracttype]
+#[derive(Clone)]
+pub struct UsageReport {
+    pub meter_id: u64,
+    pub timestamp: u64,
+    pub watt_hours_consumed: i128,
+    pub units_consumed: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct SignedUsageData {
+    pub meter_id: u64,
+    pub timestamp: u64,
+    pub watt_hours_consumed: i128,
+    pub units_consumed: i128,
+    pub signature: BytesN<64>,
+    pub public_key: BytesN<32>,
+}
 
 #[contracttype]
 #[derive(Clone)]
@@ -245,6 +291,17 @@ pub struct WithdrawalRequest {
 }
 
 #[contracttype]
+#[derive(Clone)]
+pub struct StreamUpdatedEvent {
+    pub stream_id: u64,
+    pub old_flow_rate: i128,
+    pub new_flow_rate: i128,
+    pub timestamp: u64,
+    pub old_status: StreamStatus,
+    pub new_status: StreamStatus,
+}
+
+#[contracttype]
 pub enum DataKey {
     Meter(u64),
     Count,
@@ -260,66 +317,7 @@ pub enum DataKey {
     SupportedToken(Address),
     SupportedWithdrawalToken(Address),
     ProviderTotalPool(Address),
-    Referral(Address),
-    PollVotes(Symbol),
-    UserVoted(Address, Symbol),
-    BillingGroup(Address),
-    WebhookConfig(Address),
-    LastAlert(u64),
-    ClosingFeeBps,
-    Contributor(u64, Address),
-    AuthorizedContributor(u64, Address),
-    // Task #2: Tax Compliance
-    GovernmentVault(Address),
-    TaxRateBps, // Tax rate in basis points (e.g., 500 = 5%)
-    // Task #3: Self-Maintenance
-    MaintenanceFund(u64), // Per-meter maintenance fund balance
-    AutoExtendThreshold, // Ledger threshold for auto-extension
-    // Task #4: Wasm Hash Rotation
-    ProposedUpgrade,
-    UpgradeProposalTime,
-    VetoDeadline,
-    UserVetoed(Address, u64), // Address and proposal ID
-    // NEW TASKS:
-    // Task #1: Admin Transfer
-    CurrentAdmin,
-    AdminTransferProposal,
-    AdminVeto(Address, u64), // Address and proposal timestamp
-    ActiveUsers, // For tracking active users for voting
-    // Task #2: Legal Freeze
-    ComplianceOfficer,
-    ComplianceCouncil,
-    LegalFreeze(u64),
-    LegalVault,
-    // Task #3: Verified Provider Registry
-    VerifiedProvider(Address),
-    // Issue #127: Reputation Migration
-    UserReputation(Address),
-    ReputationMigration(BytesN<32>), // Using nullifier as key
-    MigratedReputation(Address, Address), // (user, old_contract)
-    // Issue #119: Maintenance Milestones
-    MaintenanceMilestone(u64, u32), // (meter_id, milestone_number)
-    // Issue #118: ZK Privacy
-    ZKProof(BytesN<32>), // Using commitment as key
-    NullifierMap(BytesN<32>), // Using nullifier as key
-    ZKUsageReport(u64, u32), // (meter_id, billing_cycle)
-    PrivateBillingStatus(u64), // meter_id -> PrivateBillingStatus
-    CommitmentBatch(u64, u64), // (meter_id, batch_timestamp)
-    ZKEnabledMeters, // Set of meters with privacy enabled
-    ZKVerificationCache(BytesN<32>), // proof_hash -> bool (verification result cache)
-    // Issue #130: Grant Stream Integration
-    ConservationGoal(u64),
-    GrantStreamMatch(u64, Address), // (meter_id, grant_contract)
-    // Task #4: Sub-DAO
-    SubDaoConfig(Address),
-    // Issue #98: Multi-Sig Provider Withdrawal
-    MultiSigConfig(Address),           // Provider address -> MultiSigConfig
-    WithdrawalRequest(Address, u64),   // Provider address, request ID -> WithdrawalRequest
-    WithdrawalRequestCount(Address),   // Provider address -> request counter
-    WithdrawalApproval(Address, u64, Address), // Provider, request ID, signer -> bool
-    // Streaming-Limit Circuit Breaker
-    VelocityLimitConfig,               // Global velocity configuration
-    VelocityOverride(u64),             // meter_id (0 for global) -> VelocityOverride
+    ContinuousFlow(u64),
 }
 
 #[contracterror]
@@ -822,6 +820,212 @@ fn is_nullifier_used(env: &Env, nullifier: BytesN<32>) -> bool {
 /// Store nullifier to prevent double-spending
 fn store_nullifier(env: &Env, nullifier: BytesN<32>) {
     env.storage().instance().set(&DataKey::NullifierMap(nullifier), &true);
+}
+
+// Continuous Flow Math Engine Functions
+
+/// Create a new continuous flow stream with timestamp-based tracking
+fn create_continuous_flow(
+    stream_id: u64,
+    flow_rate_per_second: i128,
+    initial_balance: i128,
+    current_timestamp: u64,
+) -> ContinuousFlow {
+    ContinuousFlow {
+        stream_id,
+        flow_rate_per_second,
+        accumulated_balance: initial_balance,
+        last_flow_timestamp: current_timestamp,
+        created_timestamp: current_timestamp,
+        status: if initial_balance > 0 { StreamStatus::Active } else { StreamStatus::Paused },
+        reserved: [0u8; 7],
+    }
+}
+
+/// Calculate flow accumulation since last update with precise timestamp math
+fn calculate_flow_accumulation(
+    flow: &ContinuousFlow,
+    current_timestamp: u64,
+) -> i128 {
+    if flow.status != StreamStatus::Active {
+        return 0;
+    }
+
+    // Prevent underflow with checked subtraction
+    let elapsed_seconds = match current_timestamp.checked_sub(flow.last_flow_timestamp) {
+        Some(elapsed) => elapsed,
+        None => return 0, // Timestamp went backwards, no accumulation
+    };
+
+    // Use i128 for precise calculation to prevent overflow
+    let elapsed_i128 = elapsed_seconds as i128;
+    
+    // Calculate accumulated flow: rate * time
+    // flow_rate_per_second is in micro-stroops per second
+    let accumulated = flow.flow_rate_per_second.saturating_mul(elapsed_i128);
+    
+    accumulated
+}
+
+/// Update flow with new timestamp and handle underflow risks
+fn update_continuous_flow(
+    flow: &mut ContinuousFlow,
+    current_timestamp: u64,
+) -> Result<i128, ContractError> {
+    let accumulation = calculate_flow_accumulation(flow, current_timestamp);
+    
+    // Handle underflow: ensure we don't go below zero balance
+    if flow.accumulated_balance < accumulation {
+        // Deplete the balance and set status to Depleted
+        let actual_deduction = flow.accumulated_balance;
+        flow.accumulated_balance = 0;
+        flow.status = StreamStatus::Depleted;
+        flow.last_flow_timestamp = current_timestamp;
+        return Ok(actual_deduction);
+    }
+    
+    // Normal case: deduct accumulation from balance
+    flow.accumulated_balance = flow.accumulated_balance.saturating_sub(accumulation);
+    flow.last_flow_timestamp = current_timestamp;
+    
+    // Update status based on remaining balance
+    if flow.accumulated_balance == 0 {
+        flow.status = StreamStatus::Depleted;
+    } else if flow.status == StreamStatus::Paused && flow.accumulated_balance > 0 {
+        flow.status = StreamStatus::Active;
+    }
+    
+    Ok(accumulation)
+}
+
+/// Update flow rate with authentication and event emission
+fn update_flow_rate(
+    env: &Env,
+    stream_id: u64,
+    new_flow_rate: i128,
+) -> Result<(), ContractError> {
+    let mut flow = get_continuous_flow_or_panic(env, stream_id);
+    
+    // Require authentication for flow rate changes
+    env.current_contract_address().require_auth();
+    
+    let old_flow_rate = flow.flow_rate_per_second;
+    let old_status = flow.status;
+    
+    flow.flow_rate_per_second = new_flow_rate;
+    
+    // Update status based on new flow rate and balance
+    if new_flow_rate == 0 {
+        flow.status = StreamStatus::Paused;
+    } else if flow.accumulated_balance > 0 && flow.status == StreamStatus::Paused {
+        flow.status = StreamStatus::Active;
+    }
+    
+    // Update timestamp to current time
+    let current_timestamp = env.ledger().timestamp();
+    
+    // Emit detailed StreamUpdated event
+    let event = StreamUpdatedEvent {
+        stream_id,
+        old_flow_rate,
+        new_flow_rate,
+        timestamp: current_timestamp,
+        old_status,
+        new_status: flow.status,
+    };
+    
+    env.events().publish(
+        symbol_short!("StreamUpdated"),
+        (stream_id, old_flow_rate, new_flow_rate, current_timestamp, old_status as u32, flow.status as u32)
+    );
+    
+    // Store updated flow
+    env.storage()
+        .instance()
+        .set(&DataKey::ContinuousFlow(stream_id), &flow);
+    
+    Ok(())
+}
+
+/// Get continuous flow or panic if not found
+fn get_continuous_flow_or_panic(env: &Env, stream_id: u64) -> ContinuousFlow {
+    match env
+        .storage()
+        .instance()
+        .get::<DataKey, ContinuousFlow>(&DataKey::ContinuousFlow(stream_id))
+    {
+        Some(flow) => flow,
+        None => panic_with_error!(env, ContractError::MeterNotFound), // Reuse existing error
+    }
+}
+
+/// Add balance to continuous flow with underflow protection
+fn add_balance_to_flow(
+    env: &Env,
+    stream_id: u64,
+    additional_balance: i128,
+) -> Result<(), ContractError> {
+    if additional_balance <= 0 {
+        return Err(ContractError::InvalidTokenAmount);
+    }
+    
+    let mut flow = get_continuous_flow_or_panic(env, stream_id);
+    
+    // Update flow calculation first
+    let current_timestamp = env.ledger().timestamp();
+    update_continuous_flow(&mut flow, current_timestamp)?;
+    
+    // Add new balance with overflow protection
+    flow.accumulated_balance = flow.accumulated_balance.saturating_add(additional_balance);
+    
+    // Update status if needed
+    if flow.accumulated_balance > 0 && flow.flow_rate_per_second > 0 {
+        flow.status = StreamStatus::Active;
+    }
+    
+    // Store updated flow
+    env.storage()
+        .instance()
+        .set(&DataKey::ContinuousFlow(stream_id), &flow);
+    
+    Ok(())
+}
+
+/// Withdraw from continuous flow with high-frequency safety
+fn withdraw_from_flow(
+    env: &Env,
+    stream_id: u64,
+    withdrawal_amount: i128,
+) -> Result<i128, ContractError> {
+    if withdrawal_amount <= 0 {
+        return Err(ContractError::InvalidTokenAmount);
+    }
+    
+    let mut flow = get_continuous_flow_or_panic(env, stream_id);
+    
+    // Update flow calculation first
+    let current_timestamp = env.ledger().timestamp();
+    update_continuous_flow(&mut flow, current_timestamp)?;
+    
+    // Check if sufficient balance available
+    if flow.accumulated_balance < withdrawal_amount {
+        return Err(ContractError::InvalidTokenAmount);
+    }
+    
+    // Perform withdrawal
+    flow.accumulated_balance = flow.accumulated_balance.saturating_sub(withdrawal_amount);
+    
+    // Update status if depleted
+    if flow.accumulated_balance == 0 {
+        flow.status = StreamStatus::Depleted;
+    }
+    
+    // Store updated flow
+    env.storage()
+        .instance()
+        .set(&DataKey::ContinuousFlow(stream_id), &flow);
+    
+    Ok(withdrawal_amount)
 }
 
 #[contractimpl]
@@ -2198,2220 +2402,124 @@ impl UtilityContract {
             .publish((symbol_short!("Transfer"), meter_id), (old_user, new_user));
     }
 
-    pub fn set_closing_fee(env: Env, fee_bps: i128) {
-        // Validate fee is within reasonable bounds (0-1000 bps = 0-10%)
-        if fee_bps < 0 || fee_bps > 1000 {
-            panic_with_error!(env, ContractError::InvalidClosingFee);
-        }
-        env.storage().instance().set(&DataKey::ClosingFeeBps, &fee_bps);
-    }
+    // Continuous Flow Engine Public Interface
 
-    pub fn get_closing_fee(env: Env) -> i128 {
+    /// Create a new continuous flow stream
+    pub fn create_continuous_stream(
+        env: Env,
+        stream_id: u64,
+        flow_rate_per_second: i128,
+        initial_balance: i128,
+    ) {
+        env.current_contract_address().require_auth();
+        
+        if flow_rate_per_second < 0 || initial_balance < 0 {
+            panic_with_error!(&env, ContractError::InvalidTokenAmount);
+        }
+        
+        let current_timestamp = env.ledger().timestamp();
+        let flow = create_continuous_flow(stream_id, flow_rate_per_second, initial_balance, current_timestamp);
+        
         env.storage()
             .instance()
-            .get(&DataKey::ClosingFeeBps)
-            .unwrap_or(100) // Default 1% (100 bps)
-    }
-
-    /// Close account and withdraw remaining balance minus closing fee
-    /// Users can call this to permanently close their meter and get refunded
-    pub fn close_account_and_refund(env: Env, meter_id: u64) {
-        let mut meter = get_meter_or_panic(&env, meter_id);
-        meter.user.require_auth();
-
-        // Check if account is already closed
-        if meter.is_closed {
-            panic_with_error!(env, ContractError::AccountAlreadyClosed);
-        }
-
-        // Store old meter value for pool update
-        let old_meter_value = provider_meter_value(&meter);
-
-        // Calculate refundable amount based on billing type
-        let refundable_amount = match meter.billing_type {
-            BillingType::PrePaid => meter.balance,
-            BillingType::PostPaid => {
-                // For postpaid, refund any remaining collateral
-                remaining_postpaid_collateral(&meter)
-            }
-        };
-
-        // Check if there's anything to refund
-        if refundable_amount <= 0 {
-            panic_with_error!(env, ContractError::InsufficientBalance);
-        }
-
-        // Get closing fee and calculate fee amount
-        let closing_fee_bps = Self::get_closing_fee(env.clone());
-        let closing_fee_amount = (refundable_amount * closing_fee_bps) / 10000;
-        let final_refund_amount = refundable_amount.saturating_sub(closing_fee_amount);
-
-        // Convert USD cents to XLM if needed for withdrawal
-        let withdrawal_amount = match convert_usd_to_xlm_if_needed(&env, final_refund_amount, &meter.token) {
-            Ok(amount) => amount,
-            Err(_) => panic_with_error!(&env, ContractError::PriceConversionFailed),
-        };
-
-        // Transfer closing fee to maintenance wallet if configured
-        if closing_fee_amount > 0 {
-            if let Some(maintenance_wallet) = env.storage().instance().get::<_, Address>(&DataKey::MaintenanceWallet) {
-                let fee_withdrawal_amount = match convert_usd_to_xlm_if_needed(&env, closing_fee_amount, &meter.token) {
-                    Ok(amount) => amount,
-                    Err(_) => panic_with_error!(&env, ContractError::PriceConversionFailed),
-                };
-
-                let token_client = token::Client::new(&env, &meter.token);
-                token_client.transfer(&env.current_contract_address(), &maintenance_wallet, &fee_withdrawal_amount);
-            }
-        }
-
-        // Transfer refund to user
-        if final_refund_amount > 0 {
-            let token_client = token::Client::new(&env, &meter.token);
-            token_client.transfer(&env.current_contract_address(), &meter.user, &withdrawal_amount);
-        }
-
-        // Close the account
-        meter.is_closed = true;
-        meter.is_active = false;
-        meter.balance = 0;
-        meter.debt = 0;
-        meter.collateral_limit = 0;
-
-        let now = env.ledger().timestamp();
-        meter.last_update = now;
-
-        // Update provider total pool
-        let new_meter_value = provider_meter_value(&meter);
-        update_provider_total_pool(&env, &meter.provider, old_meter_value, new_meter_value);
-
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
-
-        // Emit events
+            .set(&DataKey::ContinuousFlow(stream_id), &flow);
+        
         env.events().publish(
-            (symbol_short!("AccountClosed"), meter_id),
-            (refundable_amount, closing_fee_amount, final_refund_amount)
-        );
-
-        // Emit conversion event if XLM was used
-        if is_native_token(&meter.token) {
-            env.events().publish(
-                (symbol_short!("RefundUSDToXLM"), meter_id),
-                (final_refund_amount, withdrawal_amount)
-            );
-        }
-    }
-
-    /// Withdraw earnings with path payment support - allows provider to receive XLM
-    /// even when payments were made in USDC or other tokens
-    pub fn withdraw_earnings_path_payment(env: Env, meter_id: u64, amount_usd_cents: i128, destination_token: Address) {
-        let mut meter = get_meter_or_panic(&env, meter_id);
-        meter.provider.require_auth();
-
-        if amount_usd_cents <= 0 {
-            panic_with_error!(&env, ContractError::InvalidTokenAmount);
-        }
-
-        // Check if destination token is supported for withdrawal
-        if !Self::is_withdrawal_token_supported(env.clone(), destination_token.clone()) {
-            panic_with_error!(&env, ContractError::InvalidTokenAmount);
-        }
-
-        // Store old meter value for pool update
-        let old_meter_value = provider_meter_value(&meter);
-
-        let available_earnings = match meter.billing_type {
-            BillingType::PrePaid => meter.balance,
-            BillingType::PostPaid => meter.debt,
-        };
-
-        if amount_usd_cents > available_earnings {
-            panic_with_error!(&env, ContractError::InvalidTokenAmount);
-        }
-
-        // If destination token is same as meter token, use regular withdrawal
-        if destination_token == meter.token {
-            Self::withdraw_earnings(env.clone(), meter_id, amount_usd_cents);
-            return;
-        }
-
-        // Convert USD cents to destination token amount
-        let withdrawal_amount = match convert_usd_to_token_if_needed(&env, amount_usd_cents, &destination_token) {
-            Ok(amount) => amount,
-            Err(_) => panic_with_error!(&env, ContractError::PriceConversionFailed),
-        };
-
-        // For path payment, we need to:
-        // 1. Convert from meter token to USD (if not already USD)
-        // 2. Convert from USD to destination token
-        // This is handled by the oracle conversion functions
-
-        // Transfer destination tokens to provider
-        let destination_client = token::Client::new(&env, &destination_token);
-
-        // Check if contract has enough destination tokens
-        let contract_balance = destination_client.balance(&env.current_contract_address());
-        if contract_balance < withdrawal_amount {
-            panic_with_error!(&env, ContractError::InsufficientBalance);
-        }
-
-        destination_client.transfer(&env.current_contract_address(), &meter.provider, &withdrawal_amount);
-
-        // Update meter balance/debt (deduct in USD cents)
-        match meter.billing_type {
-            BillingType::PrePaid => {
-                meter.balance = meter.balance.saturating_sub(amount_usd_cents);
-            }
-            BillingType::PostPaid => {
-                meter.debt = meter.debt.saturating_sub(amount_usd_cents);
-            }
-        }
-
-        let now = env.ledger().timestamp();
-        let was_active = meter.is_active;
-        refresh_activity(&mut meter, now);
-
-        if !was_active && meter.is_active {
-            meter.last_update = now;
-        }
-
-        // Update provider total pool
-        let new_meter_value = provider_meter_value(&meter);
-        update_provider_total_pool(&env, &meter.provider, old_meter_value, new_meter_value);
-
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
-
-        // Emit path payment event
-        env.events().publish(
-            (symbol_short!("PathPay"), meter_id),
-            (
-                meter.token,
-                destination_token.clone(),
-                amount_usd_cents,
-                withdrawal_amount,
-            ),
-        );
-
-        // Issue #107: Cross-Border Settlement Event for Inter-Anchor communication
-        env.events().publish(
-            (symbol_short!("XBrder"), meter_id),
-            (meter.provider.clone(), destination_token.clone(), withdrawal_amount)
+            symbol_short!("StreamCreated"),
+            (stream_id, flow_rate_per_second, initial_balance, current_timestamp)
         );
     }
 
-    /// Get supported withdrawal tokens for a provider
-    pub fn get_supported_withdrawal_tokens(env: Env) -> Vec<Address> {
-        let mut supported_tokens = Vec::new(&env);
-
-        // Add XLM as native token - represented by the contract's own address for native token
-        // In Stellar, native token operations use the contract address directly
-        supported_tokens.push_back(env.current_contract_address());
-
-        // In a full implementation, you would iterate through stored supported withdrawal tokens
-        // For now, we return just the native token
-
-        supported_tokens
-    }
-
-    /// Check if a token is supported for withdrawal
-    pub fn is_withdrawal_token_supported(env: Env, token: Address) -> bool {
-        // Always support native token (XLM)
-        if token == env.current_contract_address() {
-            return true;
+    /// Update the flow rate of an existing continuous stream
+    pub fn update_continuous_flow_rate(env: Env, stream_id: u64, new_flow_rate: i128) {
+        if new_flow_rate < 0 {
+            panic_with_error!(&env, ContractError::InvalidTokenAmount);
         }
-
-        // Check if token is in supported withdrawal tokens list
-        env.storage().instance().get::<DataKey, bool>(&DataKey::SupportedWithdrawalToken(token)).unwrap_or(false)
+        
+        update_flow_rate(&env, stream_id, new_flow_rate).unwrap();
     }
 
-    /// Get refund estimate for a meter (does not execute the refund)
-    pub fn get_refund_estimate(env: Env, meter_id: u64) -> Option<(i128, i128, i128)> {
-        if let Some(meter) = env.storage().instance().get::<_, Meter>(&DataKey::Meter(meter_id)) {
-            if meter.is_closed {
+    /// Add balance to a continuous flow stream
+    pub fn add_continuous_balance(env: Env, stream_id: u64, additional_balance: i128) {
+        add_balance_to_flow(&env, stream_id, additional_balance).unwrap();
+        
+        env.events().publish(
+            symbol_short!("BalanceAdded"),
+            (stream_id, additional_balance)
+        );
+    }
+
+    /// Withdraw from a continuous flow stream
+    pub fn withdraw_continuous(env: Env, stream_id: u64, withdrawal_amount: i128) -> i128 {
+        let withdrawn = withdraw_from_flow(&env, stream_id, withdrawal_amount).unwrap();
+        
+        env.events().publish(
+            symbol_short!("Withdrawal"),
+            (stream_id, withdrawn)
+        );
+        
+        withdrawn
+    }
+
+    /// Get the current state of a continuous flow stream
+    pub fn get_continuous_flow(env: Env, stream_id: u64) -> Option<ContinuousFlow> {
+        env.storage()
+            .instance()
+            .get::<DataKey, ContinuousFlow>(&DataKey::ContinuousFlow(stream_id))
+    }
+
+    /// Calculate expected depletion time for a continuous flow stream
+    pub fn calculate_continuous_depletion(env: Env, stream_id: u64) -> Option<u64> {
+        if let Some(flow) = env.storage()
+            .instance()
+            .get::<DataKey, ContinuousFlow>(&DataKey::ContinuousFlow(stream_id))
+        {
+            if flow.status != StreamStatus::Active || flow.flow_rate_per_second <= 0 {
                 return None;
             }
-
-            let refundable_amount = match meter.billing_type {
-                BillingType::PrePaid => meter.balance,
-                BillingType::PostPaid => remaining_postpaid_collateral(&meter),
-            };
-
-            if refundable_amount <= 0 {
-                return None;
+            
+            let current_timestamp = env.ledger().timestamp();
+            let accumulation = calculate_flow_accumulation(&flow, current_timestamp);
+            let remaining_balance = flow.accumulated_balance.saturating_sub(accumulation);
+            
+            if remaining_balance <= 0 {
+                return Some(current_timestamp);
             }
-
-            let closing_fee_bps = Self::get_closing_fee(env.clone());
-            let closing_fee_amount = (refundable_amount * closing_fee_bps) / 10000;
-            let final_refund_amount = refundable_amount.saturating_sub(closing_fee_amount);
-
-            Some((refundable_amount, closing_fee_amount, final_refund_amount))
+            
+            let seconds_until_depletion = remaining_balance / flow.flow_rate_per_second;
+            Some(current_timestamp + seconds_until_depletion as u64)
         } else {
             None
         }
     }
 
-    // Group Billing Functions
-    pub fn create_billing_group(env: Env, parent_account: Address) {
-        parent_account.require_auth();
-
-        let billing_group = BillingGroup {
-            parent_account: parent_account.clone(),
-            child_meters: Vec::new(),
-            created_at: env.ledger().timestamp(),
-        };
-
-        env.storage().instance().set(&DataKey::BillingGroup(parent_account), &billing_group);
+    /// Pause a continuous flow stream
+    pub fn pause_continuous_flow(env: Env, stream_id: u64) {
+        update_flow_rate(&env, stream_id, 0).unwrap();
     }
 
-    fn add_meter_to_billing_group(env: Env, parent_account: Address, meter_id: u64) {
-        let mut billing_group: BillingGroup = env.storage().instance()
-            .get(&DataKey::BillingGroup(parent_account.clone()))
-            .unwrap_or_else(|| BillingGroup {
-                parent_account: parent_account.clone(),
-                child_meters: Vec::new(),
-                created_at: env.ledger().timestamp(),
-            });
-
-        // Add meter to the group if not already present
-        if !billing_group.child_meters.contains(&meter_id) {
-            billing_group.child_meters.push(meter_id);
-            env.storage().instance().set(&DataKey::BillingGroup(parent_account), &billing_group);
-        }
-    }
-
-    pub fn group_top_up(env: Env, parent_account: Address, amount_per_meter: i128) {
-        parent_account.require_auth();
-
-        let billing_group: BillingGroup = env.storage().instance()
-            .get(&DataKey::BillingGroup(parent_account.clone()))
-            .ok_or("Billing group not found").unwrap();
-
-        if billing_group.child_meters.is_empty() {
-            return;
-        }
-
-        let total_amount = amount_per_meter * billing_group.child_meters.len() as i128;
-
-        // Transfer total amount from parent to contract
-        if let Some(first_meter_id) = billing_group.child_meters.first() {
-            if let Some(first_meter) = env.storage().instance().get::<_, Meter>(&DataKey::Meter(*first_meter_id)) {
-                let client = token::Client::new(&env, &first_meter.token);
-                client.transfer(&parent_account, &env.current_contract_address(), &total_amount);
-            }
-        }
-
-        // Distribute funds to all child meters
-        for &meter_id in &billing_group.child_meters {
-            if let Some(mut meter) = env.storage().instance().get::<_, Meter>(&DataKey::Meter(meter_id)) {
-                meter.balance += amount_per_meter;
-                meter.is_active = true;
-                meter.last_update = env.ledger().timestamp();
-                env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
-            }
-        }
-    }
-
-    pub fn get_billing_group(env: Env, parent_account: Address) -> Option<BillingGroup> {
-        env.storage().instance().get(&DataKey::BillingGroup(parent_account))
-    }
-
-    pub fn remove_meter_from_billing_group(env: Env, parent_account: Address, meter_id: u64) {
-        parent_account.require_auth();
-
-        let mut billing_group: BillingGroup = env.storage().instance()
-            .get(&DataKey::BillingGroup(parent_account.clone()))
-            .ok_or("Billing group not found").unwrap();
-
-        billing_group.child_meters.retain(|&id| id != meter_id);
-        env.storage().instance().set(&DataKey::BillingGroup(parent_account), &billing_group);
-
-        // Update the meter to remove parent reference
-        if let Some(mut meter) = env.storage().instance().get::<_, Meter>(&DataKey::Meter(meter_id)) {
-            meter.parent_account = None;
-            env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
-        }
-    }
-
-    // Gas Cost Estimator Functions
-    pub fn estimate_meter_monthly_cost(
-        env: Env,
-        is_group_meter: bool,
-        _meters_in_group: u32,
-    ) -> i128 {
-        GasCostEstimator::estimate_meter_monthly_cost(&env, is_group_meter, _meters_in_group)
-    }
-
-    pub fn get_operation_cost(_env: Env, operation: String) -> i128 {
-        GasCostEstimator::get_operation_cost(&operation)
-    }
-
-    // Webhook and Alert Functions
-    pub fn configure_webhook(env: Env, user: Address, webhook_url: String) {
-        user.require_auth();
-
-        let webhook_config = WebhookConfig {
-            url: webhook_url.clone(),
-            user: user.clone(),
-            is_active: true,
-            created_at: env.ledger().timestamp(),
-        };
-
-        env.storage().instance().set(&DataKey::WebhookConfig(user), &webhook_config);
-    }
-
-    pub fn deactivate_webhook(env: Env, user: Address) {
-        user.require_auth();
-
-        if let Some(mut config) = env.storage().instance().get::<_, WebhookConfig>(&DataKey::WebhookConfig(user.clone())) {
-            config.is_active = false;
-            env.storage().instance().set(&DataKey::WebhookConfig(user), &config);
-        }
-    }
-
-    pub fn get_webhook_config(env: Env, user: Address) -> Option<WebhookConfig> {
-        env.storage().instance().get(&DataKey::WebhookConfig(user))
-    }
-
-    fn check_and_send_low_balance_alert(env: &Env, meter: &Meter, meter_id: u64) {
-        // Only check if webhook is configured for this user
-        let webhook_config = match env.storage().instance().get::<_, WebhookConfig>(&DataKey::WebhookConfig(meter.user.clone())) {
-            Some(config) if config.is_active => config,
-            _ => return, // No active webhook configured
-        };
-
-        // Calculate hours remaining
-        let hours_remaining = if meter.rate_per_second > 0 {
-            meter.balance as f32 / meter.rate_per_second as f32 / 3600.0
-        } else {
-            f32::INFINITY
-        };
-
-        // Check if balance is low (< 24 hours)
-        if hours_remaining < 24.0 {
-            // Check if we've sent an alert recently (within last 12 hours)
-            let current_time = env.ledger().timestamp();
-            let last_alert_time: Option<u64> = env.storage().instance().get(&DataKey::LastAlert(meter_id));
-
-            if let Some(last_time) = last_alert_time {
-                if current_time.checked_sub(last_time).unwrap_or(0) < 43200 { // 12 hours in seconds
-                    return; // Already sent alert recently
-                }
-            }
-
-            // Create and send alert
-            let alert = LowBalanceAlert {
-                meter_id,
-                user: meter.user.clone(),
-                remaining_balance: meter.balance,
-                hours_remaining,
-                timestamp: current_time,
-            };
-
-            // Store the alert timestamp
-            env.storage().instance().set(&DataKey::LastAlert(meter_id), &current_time);
-
-            // In a real implementation, this would make an HTTP call to the webhook
-            // For now, we'll store the alert in contract storage for demonstration
-            let alert_key = format!("alert:{}:{}", meter_id, current_time);
-            env.storage().instance().set(&alert_key, &alert);
-        }
-    }
-
-    pub fn get_pending_alerts(env: Env, user: Address) -> Vec<LowBalanceAlert> {
-        let mut alerts = Vec::new();
-
-        // This is a simplified implementation
-        // In practice, you'd want to iterate through storage more efficiently
-        let count: u64 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
-
-        for meter_id in 1..=count {
-            if let Some(meter) = env.storage().instance().get::<_, Meter>(&DataKey::Meter(meter_id)) {
-                if meter.user == user {
-                    // Check for recent alerts
-                    let current_time = env.ledger().timestamp();
-                    let alert_key = format!("alert:{}:{}", meter_id, current_time);
-                    if let Some(alert) = env.storage().instance().get::<_, LowBalanceAlert>(&alert_key) {
-                        alerts.push(alert);
-                    }
-                }
-            }
-        }
-
-        alerts
-    }
-
-    // Enhanced claim function with webhook integration
-    pub fn claim_with_alerts(env: Env, meter_id: u64) {
-        let mut meter = get_meter_or_panic(&env, meter_id);
-        meter.provider.require_auth();
-
-        // Task #88: Kill-Switch Check
-        if meter.is_disputed {
-            panic_with_error!(&env, ContractError::InDispute);
-        }
-
-        let now = env.ledger().timestamp();
-        let elapsed = now.checked_sub(meter.last_update).unwrap_or(0);
-
-        // Task #90: Credit Settlement Flow
-        let amount = (elapsed as i128).saturating_mul(meter.rate_per_unit.saturating_add(meter.credit_drip_rate));
-
-        // Check if we need to reset the hourly counter
-        let hours_passed = now.checked_sub(meter.last_claim_time).unwrap_or(0) / 3600;
-        if hours_passed >= 1 {
-            meter.claimed_this_hour = 0;
-            meter.last_claim_time = now;
-        }
-
-        // Ensure we don't overdraw the balance
-        let claimable = if amount > meter.balance {
-            meter.balance
-        } else {
-            amount
-        };
-
-        // Apply max flow rate cap
-        let final_claimable = if claimable > 0 {
-            let remaining_hourly_capacity = meter.max_flow_rate_per_hour - meter.claimed_this_hour;
-            if claimable > remaining_hourly_capacity {
-                remaining_hourly_capacity
-            } else {
-                claimable
-            }
-        } else {
-            0
-        };
-
-        if final_claimable > 0 {
-            let client = token::Client::new(&env, &meter.token);
-            client.transfer(&env.current_contract_address(), &meter.provider, &final_claimable);
-            meter.balance -= final_claimable;
-            meter.claimed_this_hour += final_claimable;
-
-            // If credit drip was active, reduce the debt if in PostPaid mode
-            if meter.billing_type == BillingType::PostPaid && meter.credit_drip_rate > 0 {
-                let credit_settlement = (elapsed as i128).saturating_mul(meter.credit_drip_rate).min(meter.debt);
-                meter.debt = meter.debt.saturating_sub(credit_settlement);
-            }
-        }
-
-        meter.last_update = now;
-        if meter.balance <= 0 {
-            meter.is_active = false;
-        }
-
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
-
-        // Check for low balance and send alert if needed
-        Self::check_and_send_low_balance_alert(&env, &meter, meter_id);
-    }
-
-    // Task #87: Roommates support
-    pub fn add_authorized_contributor(env: Env, meter_id: u64, contributor: Address) {
-        let meter = get_meter_or_panic(&env, meter_id);
-        meter.user.require_auth();
-
-        env.storage().instance().set(&DataKey::AuthorizedContributor(meter_id, contributor), &true);
-    }
-
-    pub fn remove_authorized_contributor(env: Env, meter_id: u64, contributor: Address) {
-        let meter = get_meter_or_panic(&env, meter_id);
-        meter.user.require_auth();
-
-        env.storage().instance().remove(&DataKey::AuthorizedContributor(meter_id, contributor));
-    }
-
-    pub fn get_contribution(env: Env, meter_id: u64, contributor: Address) -> i128 {
-        env.storage().instance().get(&DataKey::Contributor(meter_id, contributor)).unwrap_or(0)
-    }
-
-    // Task #88: Emergency Kill-Switch (Challenge)
-    pub fn challenge_service(env: Env, meter_id: u64) {
-        let mut meter = get_meter_or_panic(&env, meter_id);
-        meter.user.require_auth();
-
-        if meter.is_disputed {
-            panic_with_error!(&env, ContractError::ChallengeActive);
-        }
-
-        meter.is_disputed = true;
-        meter.is_paused = true;
-        meter.challenge_timestamp = env.ledger().timestamp();
-
-        let now = env.ledger().timestamp();
-        refresh_activity(&mut meter, now);
-
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
-
-        env.events().publish((symbol_short!("Challeng"), meter_id), meter.challenge_timestamp);
-    }
-
-    pub fn resolve_challenge(env: Env, meter_id: u64, restored: bool) {
-        let mut meter: Meter = env
-            .storage()
-            .instance()
-            .get(&DataKey::Meter(meter_id))
-            .expect("Meter not found");
-
-        // This should be called by the Oracle or Admin
-        let oracle: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Oracle)
-            .expect("No oracle set");
-
-        oracle.require_auth();
-
-        if !meter.is_disputed {
-            return;
-        }
-
-        if restored {
-            // Service restored, unpause and resume stream
-            meter.is_disputed = false;
-            meter.is_paused = false;
-        } else {
-            // Service NOT restored
-            meter.is_disputed = false; // Resolved but failed
-            meter.is_paused = true; // Stay paused
-        }
-
-        let now = env.ledger().timestamp();
-        refresh_activity(&mut meter, now);
-
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
-
-        env.events().publish((symbol_short!("Resolv"), meter_id), restored);
-    }
-
-    pub fn refund_disputed_funds(env: Env, meter_id: u64) {
-        let mut meter = get_meter_or_panic(&env, meter_id);
-        meter.user.require_auth();
-
-        // Can only refund if challenged more than 48 hours ago and not resolved
-        let now = env.ledger().timestamp();
-        if !meter.is_disputed || now.saturating_sub(meter.challenge_timestamp) < (48 * HOUR_IN_SECONDS) {
-            panic_with_error!(&env, ContractError::ChallengeActive);
-        }
-
-        // Return funds to user
-        let refundable = match meter.billing_type {
-            BillingType::PrePaid => meter.balance,
-            BillingType::PostPaid => remaining_postpaid_collateral(&meter),
-        };
-
-        if refundable > 0 {
-            let withdrawal_amount = match convert_usd_to_xlm_if_needed(&env, refundable, &meter.token) {
-                Ok(amount) => amount,
-                Err(_) => panic_with_error!(&env, ContractError::PriceConversionFailed),
-            };
-
-            let client = token::Client::new(&env, &meter.token);
-            client.transfer(&env.current_contract_address(), &meter.user, &withdrawal_amount);
-        }
-
-        meter.balance = 0;
-        meter.debt = 0;
-        meter.is_active = false;
-        meter.is_disputed = false;
-
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
-
-        env.events().publish((symbol_short!("Refund"), meter_id), refundable);
-    }
-
-    // Task #90: Post-Paid Settlement Credit Logic
-    pub fn set_credit_drip(env: Env, meter_id: u64, drip_rate: i128) {
-        let mut meter = get_meter_or_panic(&env, meter_id);
-        meter.provider.require_auth();
-
-        meter.credit_drip_rate = drip_rate;
-
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
-    }
-
-    // Task #1: Stream Priority System - Set priority index for a meter
-    pub fn set_priority_index(env: Env, meter_id: u64, priority_index: u32) {
-        let mut meter = get_meter_or_panic(&env, meter_id);
-        meter.user.require_auth();
-
-        meter.priority_index = priority_index;
-
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
-
-        env.events().publish(
-            (soroban_sdk::symbol_short!("Prior"), meter_id),
-            priority_index,
-        );
-    }
-
-    // Task #1: Check if throttling should be activated and pause low-priority streams
-    pub fn apply_throttling_if_needed(env: Env, meter_id: u64) {
-        let mut meter = get_meter_or_panic(&env, meter_id);
-        meter.provider.require_auth();
-
-        let throttling_active = check_throttling_threshold(&env, &meter);
-
-        if should_pause_low_priority_stream(&meter, throttling_active) {
-            meter.is_paused = true;
-            panic_with_error!(&env, ContractError::LowPriorityStreamPaused);
-        }
-
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
-
-        env.events().publish(
-            (soroban_sdk::symbol_short!("Throttl"), meter_id),
-            throttling_active,
-        );
-    }
-
-    // Task #2: Tax Compliance - Set government vault address
-    pub fn set_government_vault(env: Env, vault_address: Address) {
-        vault_address.require_auth();
-
-        env.storage()
-            .instance()
-            .set(&DataKey::GovernmentVault, &vault_address);
-
-        env.events().publish(
-            soroban_sdk::symbol_short!("GovVault"),
-            vault_address,
-        );
-    }
-
-    // Task #2: Tax Compliance - Set tax rate (in basis points)
-    pub fn set_tax_rate(env: Env, tax_rate_bps: i128) {
-        // Should be admin-only in production
-        if tax_rate_bps < 0 || tax_rate_bps > 10_000 {
-            panic_with_error!(&env, ContractError::InvalidUsageValue);
-        }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::TaxRateBps, &tax_rate_bps);
-
-        env.events().publish(
-            soroban_sdk::symbol_short!("TaxRate"),
-            tax_rate_bps,
-        );
-    }
-
-    // Task #3: Self-Maintenance - Get maintenance fund balance for a meter
-    pub fn get_maintenance_fund(env: Env, meter_id: u64) -> i128 {
-        get_maintenance_fund_balance(&env, meter_id)
-    }
-
-    // Task #3: Self-Maintenance - Manually extend TTL (emergency function)
-    pub fn manual_extend_ttl(env: Env, meter_id: u64) {
-        let maintenance_balance = get_maintenance_fund_balance(&env, meter_id);
-
-        // Estimate cost (simplified)
-        let estimated_cost = 1_000_000; // 1 XLM in stroops
-
-        if maintenance_balance < estimated_cost {
-            panic_with_error!(&env, ContractError::MaintenanceFundInsufficient);
-        }
-
-        // Deduct from maintenance fund
-        let new_balance = maintenance_balance.saturating_sub(estimated_cost);
-        env.storage()
-            .instance()
-            .set(&DataKey::MaintenanceFund(meter_id), &new_balance);
-
-        // Extend TTL
-        env.storage().instance().extend_ttl(LEDGER_LIFETIME_EXTENSION, LEDGER_LIFETIME_EXTENSION);
-
-        env.events().publish(
-            (soroban_sdk::symbol_short!("TTLMnl"), meter_id),
-            LEDGER_LIFETIME_EXTENSION,
-        );
-    }
-
-    // Task #4: Wasm Hash Rotation - Propose upgrade
-    pub fn propose_upgrade(env: Env, new_wasm_hash: BytesN<32>) {
-        let proposer = env.current_contract_address();
-        proposer.require_auth();
-
-        // Validate hash (basic check - should be non-zero)
-        if new_wasm_hash == BytesN::<32>::from_array(&env, &[0; 32]) {
-            panic_with_error!(&env, ContractError::InvalidWasmHash);
-        }
-
-        // Check if there's already an active proposal
-        let existing_proposal_time: Option<u64> = env.storage().instance().get(&DataKey::UpgradeProposalTime);
-        if let Some(proposal_time) = existing_proposal_time {
-            let deadline: u64 = env.storage().instance().get(&DataKey::VetoDeadline).unwrap_or(0);
-            let now = env.ledger().timestamp();
-
-            if now < deadline {
-                panic_with_error!(&env, ContractError::UpgradeProposalActive);
-            }
-        }
-
-        let proposal_id = propose_upgrade_impl(&env, new_wasm_hash, &proposer);
-
-        env.events().publish(
-            soroban_sdk::symbol_short!("UpgrdProp"),
-            proposal_id,
-        );
-    }
-
-    // Task #4: Wasm Hash Rotation - Submit veto
-    pub fn submit_upgrade_veto(env: Env, proposal_id: u64) {
-        let user = env.current_contract_address();
-        user.require_auth();
-
-        // Check if veto period is still active
-        let deadline: u64 = env.storage().instance().get(&DataKey::VetoDeadline).unwrap_or(0);
-        let now = env.ledger().timestamp();
-
-        if now >= deadline {
-            panic_with_error!(&env, ContractError::VetoPeriodExpired);
-        }
-
-        submit_veto(&env, &user, proposal_id);
-    }
-
-    // Task #4: Wasm Hash Rotation - Finalize upgrade
-    pub fn finalize_upgrade(env: Env) {
-        // Check if upgrade can be finalized
-        if !can_finalize_upgrade(&env) {
-            panic_with_error!(&env, ContractError::UpgradeProposalActive);
-        }
-
-        // Get the proposed upgrade
-        let proposal: UpgradeProposal = env
-            .storage()
-            .instance()
-            .get(&DataKey::ProposedUpgrade)
-            .expect("No upgrade proposal found");
-
-        // In a real implementation, this would call env.deployer().update_current_contract_wasm()
-        // For now, we just emit an event indicating the upgrade is ready
-        env.events().publish(
-            soroban_sdk::symbol_short!("UpgrdFinsh"),
-            proposal.new_wasm_hash,
-        );
-
-        // Clear the proposal
-        env.storage().instance().remove(&DataKey::ProposedUpgrade);
-        env.storage().instance().remove(&DataKey::UpgradeProposalTime);
-        env.storage().instance().remove(&DataKey::VetoDeadline);
-    }
-
-    // ============================================================
-    // NEW TASKS IMPLEMENTATION
-    // ============================================================
-
-    // ==================== TASK #1: ADMIN TRANSFER WITH TIMELOCK ====================
-
-    /// Initialize admin transfer with 48-hour timelock
-    /// During the window, active users can veto (requires 10% to succeed)
-    pub fn initiate_admin_transfer(env: Env, proposed_admin: Address) {
-        let current_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::CurrentAdmin)
-            .expect("No admin set");
-
-        current_admin.require_auth();
-
-        // Check no active transfer
-        let existing_proposal: Option<AdminTransferProposal> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AdminTransferProposal);
-
-        if let Some(proposal) = existing_proposal {
-            if proposal.is_active && env.ledger().timestamp() < proposal.execution_deadline {
-                panic_with_error!(&env, ContractError::AdminTransferActive);
-            }
-        }
-
-        let now = env.ledger().timestamp();
-        let proposal = AdminTransferProposal {
-            current_admin: current_admin.clone(),
-            proposed_admin: proposed_admin.clone(),
-            proposed_at: now,
-            execution_deadline: now + ADMIN_TRANSFER_TIMELOCK,
-            veto_count: 0,
-            is_active: true,
-        };
-
-        env.storage().instance().set(&DataKey::AdminTransferProposal, &proposal);
-
-        env.events().publish(
-            (soroban_sdk::symbol_short!("AdminXfer"),),
-            (current_admin, proposed_admin, now + ADMIN_TRANSFER_TIMELOCK),
-        );
-    }
-
-    /// Submit veto against admin transfer
-    /// Requires 10% of active users to veto
-    pub fn veto_admin_transfer(env: Env, user: Address) {
-        user.require_auth();
-
-        let proposal: AdminTransferProposal = env
-            .storage()
-            .instance()
-            .get(&DataKey::AdminTransferProposal)
-            .expect("No active transfer");
-
-        if !proposal.is_active || env.ledger().timestamp() >= proposal.execution_deadline {
-            panic_with_error!(&env, ContractError::NoAdminTransferInProgress);
-        }
-
-        // Check if user already vetoed
-        let has_vetoed: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::AdminVeto(user.clone(), proposal.proposed_at))
-            .unwrap_or(false);
-
-        if has_vetoed {
-            panic_with_error!(&env, ContractError::AlreadyVoted);
-        }
-
-        // Record veto
-        env.storage().instance().set(&DataKey::AdminVeto(user, proposal.proposed_at), &true);
-
-        // Increment veto count
-        let mut updated_proposal = proposal;
-        updated_proposal.veto_count += 1;
-        env.storage().instance().set(&DataKey::AdminTransferProposal, &updated_proposal);
-
-        env.events().publish(
-            (soroban_sdk::symbol_short!("Veto"),),
-            updated_proposal.veto_count,
-        );
-    }
-
-    /// Execute admin transfer after 48-hour timelock if not vetoed
-    pub fn execute_admin_transfer(env: Env) {
-        let proposal: AdminTransferProposal = env
-            .storage()
-            .instance()
-            .get(&DataKey::AdminTransferProposal)
-            .expect("No active transfer");
-
-        if !proposal.is_active {
-            panic_with_error!(&env, ContractError::NoAdminTransferInProgress);
-        }
-
-        let now = env.ledger().timestamp();
-
-        // Check if execution window expired
-        if now > proposal.execution_deadline + DAY_IN_SECONDS {
-            panic_with_error!(&env, ContractError::AdminExecutionWindowExpired);
-        }
-
-        // Calculate total active users and veto threshold
-        let total_active_users: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::ActiveUsers)
-            .unwrap_or(100); // Default 100 for testing
-
-        let veto_threshold = (total_active_users as i128 * VETO_THRESHOLD_BPS / 10000) as u32;
-
-        if proposal.veto_count >= veto_threshold {
-            panic_with_error!(&env, ContractError::VetoThresholdNotReached);
-        }
-
-        // Execute transfer
-        env.storage().instance().set(&DataKey::CurrentAdmin, &proposal.proposed_admin);
-        env.storage().instance().remove(&DataKey::AdminTransferProposal);
-
-        // Clean up individual vetos
-        // (In production, you'd iterate and clean, but simplified here)
-
-        env.events().publish(
-            (soroban_sdk::symbol_short!("AdminDone"),),
-            (proposal.proposed_admin, now),
-        );
-    }
-
-    /// Set current admin (initialization only)
-    pub fn set_initial_admin(env: Env, admin: Address) {
-        // Only allow if no admin is set
-        let existing: Option<Address> = env.storage().instance().get(&DataKey::CurrentAdmin);
-        if existing.is_some() {
-            panic_with_error!(&env, ContractError::AdminTransferActive);
-        }
-
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::CurrentAdmin, &admin);
-
-        env.events().publish(
-            (soroban_sdk::symbol_short!("SetAdmn"),),
-            admin,
-        );
-    }
-
-    /// Register as active user (for governance tracking)
-    pub fn register_active_user(env: Env, user: Address) {
-        user.require_auth();
-
-        // Simplified: just increment counter
-        let count: u32 = env.storage().instance().get(&DataKey::ActiveUsers).unwrap_or(0);
-        env.storage().instance().set(&DataKey::ActiveUsers, &(count + 1));
-
-        env.events().publish(
-            (soroban_sdk::symbol_short!("ActvUser"),),
-            user,
-        );
-    }
-
-    // ==================== TASK #2: LEGAL FREEZE ====================
-
-    /// Initiate legal freeze on a meter (compliance officer only)
-    pub fn legal_freeze(env: Env, meter_id: u64, reason: String) {
-        let compliance_officer: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::ComplianceOfficer)
-            .expect("No compliance officer set");
-
-        compliance_officer.require_auth();
-
-        // Check if already frozen
-        let existing_freeze: Option<LegalFreeze> = env
-            .storage()
-            .instance()
-            .get(&DataKey::LegalFreeze(meter_id));
-
-        if let Some(freeze) = existing_freeze {
-            if !freeze.is_released {
-                panic_with_error!(&env, ContractError::LegalFreezeAlreadyActive);
-            }
-        }
-
-        let mut meter = get_meter_or_panic(&env, meter_id);
-
-        // Get legal vault
-        let legal_vault: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::LegalVault)
-            .expect("No legal vault set");
-
-        // Calculate frozen amount
-        let frozen_amount = match meter.billing_type {
-            BillingType::PrePaid => meter.balance,
-            BillingType::PostPaid => remaining_postpaid_collateral(&meter),
-        };
-
-        // Transfer funds to legal vault
-        if frozen_amount > 0 {
-            let withdrawal_amount = match convert_usd_to_xlm_if_needed(&env, frozen_amount, &meter.token) {
-                Ok(amount) => amount,
-                Err(_) => panic_with_error!(&env, ContractError::PriceConversionFailed),
-            };
-
-            let client = token::Client::new(&env, &meter.token);
-            client.transfer(&env.current_contract_address(), &legal_vault, &withdrawal_amount);
-        }
-
-        // Create freeze record
-        let freeze = LegalFreeze {
-            meter_id,
-            frozen_at: env.ledger().timestamp(),
-            reason: reason.clone(),
-            compliance_officer: compliance_officer.clone(),
-            legal_vault: legal_vault.clone(),
-            frozen_amount,
-            is_released: false,
-        };
-
-        env.storage().instance().set(&DataKey::LegalFreeze(meter_id), &freeze);
-
-        // Pause the meter
-        meter.is_paused = true;
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
-
-        env.events().publish(
-            (soroban_sdk::symbol_short!("LglFrz"), meter_id),
-            (reason, frozen_amount, legal_vault),
-        );
-    }
-
-    /// Release legal freeze (requires compliance council multi-sig)
-    pub fn release_legal_freeze(env: Env, meter_id: u64, council_signatures: Vec<Address>) {
-        // Verify council approval (simplified: check at least 2 signatures)
-        if council_signatures.len() < 2 {
-            panic_with_error!(&env, ContractError::ComplianceCouncilApprovalRequired);
-        }
-
-        // In production, verify each signature against council members
-        // For now, just require auth from provided addresses
-        for sig in council_signatures.iter() {
-            sig.require_auth();
-        }
-
-        let freeze: LegalFreeze = env
-            .storage()
-            .instance()
-            .get(&DataKey::LegalFreeze(meter_id))
-            .expect("No active freeze");
-
-        if freeze.is_released {
-            panic_with_error!(&env, ContractError::MeterNotFrozen);
-        }
-
-        let mut meter = get_meter_or_panic(&env, meter_id);
-
-        // Return funds from legal vault to user
-        if freeze.frozen_amount > 0 {
-            let legal_vault: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::LegalVault)
-                .expect("No legal vault set");
-
-            let withdrawal_amount = match convert_usd_to_xlm_if_needed(&env, freeze.frozen_amount, &meter.token) {
-                Ok(amount) => amount,
-                Err(_) => panic_with_error!(&env, ContractError::PriceConversionFailed),
-            };
-
-            let client = token::Client::new(&env, &meter.token);
-            client.transfer(&legal_vault, &meter.user, &withdrawal_amount);
-        }
-
-        // Update freeze record
-        let mut updated_freeze = freeze;
-        updated_freeze.is_released = true;
-        env.storage().instance().set(&DataKey::LegalFreeze(meter_id), &updated_freeze);
-
-        // Unpause meter
-        meter.is_paused = false;
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
-
-        env.events().publish(
-            (soroban_sdk::symbol_short!("FrzRls"), meter_id),
-            env.ledger().timestamp(),
-        );
-    }
-
-    /// Set compliance officer address
-    pub fn set_compliance_officer(env: Env, officer: Address) {
-        // Should be called by current admin
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::CurrentAdmin)
-            .expect("No admin set");
-
-        admin.require_auth();
-
-        env.storage().instance().set(&DataKey::ComplianceOfficer, &officer);
-
-        env.events().publish(
-            (soroban_sdk::symbol_short!("CmpOfcr"),),
-            officer,
-        );
-    }
-
-    /// Set legal vault address
-    pub fn set_legal_vault(env: Env, vault: Address) {
-        vault.require_auth();
-
-        env.storage().instance().set(&DataKey::LegalVault, &vault);
-
-        env.events().publish(
-            (soroban_sdk::symbol_short!("LglVlt"),),
-            vault,
-        );
-    }
-
-    /// Get legal freeze info
-    pub fn get_legal_freeze(env: Env, meter_id: u64) -> LegalFreeze {
-        env.storage()
-            .instance()
-            .get(&DataKey::LegalFreeze(meter_id))
-            .expect("No freeze found")
-    }
-
-    // ==================== TASK #3: VERIFIED PROVIDER REGISTRY ====================
-
-    /// Request provider verification
-    pub fn request_provider_verification(env: Env, provider_name: String) {
-        let provider = env.current_contract_address();
-        provider.require_auth();
-
-        // Check if already verified
-        let existing: Option<VerifiedProvider> = env
-            .storage()
-            .instance()
-            .get(&DataKey::VerifiedProvider(provider.clone()));
-
-        if let Some(v) = existing {
-            if v.is_verified {
-                panic_with_error!(&env, ContractError::VerificationAlreadyGranted);
-            }
-        }
-
-        // Create verification request (pending identity verification)
-        let verified_provider = VerifiedProvider {
-            address: provider.clone(),
-            is_verified: false,
-            verified_at: env.ledger().timestamp(),
-            verification_method: VerificationMethod::IdentityVerified,
-            provider_name,
-        };
-
-env.storage()
-            .instance()
-            .set(&DataKey::VerifiedProvider(provider.clone()), &verified_provider);
-
-        env.events().publish(
-            (soroban_sdk::symbol_short!("VrfReqst"),),
-            provider,
-        );
-    }
-
-    /// Grant verification to provider (admin or community vote)
-    pub fn grant_provider_verification(env: Env, provider: Address, method: VerificationMethod) {
-        // Admin can grant verification
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::CurrentAdmin)
-            .expect("No admin set");
-
-        admin.require_auth();
-
-        let mut verified_provider: VerifiedProvider = env
-            .storage()
-            .instance()
-            .get(&DataKey::VerifiedProvider(provider.clone()))
-            .expect("No verification request found");
-
-        verified_provider.is_verified = true;
-        verified_provider.verification_method = method;
-        verified_provider.verified_at = env.ledger().timestamp();
-
-        env.storage().instance().set(&DataKey::VerifiedProvider(provider.clone()), &verified_provider);
-
-        env.events().publish(
-            (soroban_sdk::symbol_short!("VrfGrnt"),),
-            provider,
-        );
-    }
-
-    /// Check if provider is verified
-    pub fn is_provider_verified(env: Env, provider: Address) -> bool {
-        let verified: Option<VerifiedProvider> = env
-            .storage()
-            .instance()
-            .get(&DataKey::VerifiedProvider(provider));
-
-        match verified {
-            Some(v) => v.is_verified,
-            None => false,
-        }
-    }
-
-    /// Get provider info
-    pub fn get_provider_info(env: Env, provider: Address) -> VerifiedProvider {
-        env.storage()
-            .instance()
-            .get(&DataKey::VerifiedProvider(provider))
-            .expect("Provider not found")
-    }
-
-    // ==================== TASK #4: SUB-DAO HIERARCHICAL PERMISSIONS ====================
-
-    /// Create Sub-DAO configuration
-    pub fn create_sub_dao(env: Env, sub_dao: Address, allocated_budget: i128, token: Address) {
-        let parent_dao = env.current_contract_address();
-        parent_dao.require_auth();
-
-        // Check budget availability (simplified)
-        let existing_config: Option<SubDaoConfig> = env
-            .storage()
-            .instance()
-            .get(&DataKey::SubDaoConfig(sub_dao.clone()));
-
-        if let Some(config) = existing_config {
-            if config.is_active {
-                panic_with_error!(&env, ContractError::SubDaoNotConfigured);
-            }
-        }
-
-        let config = SubDaoConfig {
-            parent_dao: parent_dao.clone(),
-            sub_dao: sub_dao.clone(),
-            allocated_budget,
-            spent_budget: 0,
-            token: token.clone(),
-            created_at: env.ledger().timestamp(),
-            is_active: true,
-        };
-
-        env.storage()
-            .instance()
-            .set(&DataKey::SubDaoConfig(sub_dao.clone()), &config);
-
-        env.events().publish(
-            (soroban_sdk::symbol_short!("SubDaoC"),),
-            (parent_dao, sub_dao.clone(), allocated_budget),
-        );
-    }
-
-    /// Create stream from Sub-DAO (uses allocated budget)
-    pub fn create_sub_dao_stream(
-        env: Env,
-        user: Address,
-        provider: Address,
-        off_peak_rate: i128,
-        token: Address,
-        device_public_key: BytesN<32>,
-        priority_index: u32,
-    ) -> u64 {
-        // Verify caller is a configured Sub-DAO
-        let sub_dao = env.current_contract_address();
-
-        let config: SubDaoConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::SubDaoConfig(sub_dao.clone()))
-            .expect("Sub-DAO not configured");
-
-        if !config.is_active {
-            panic_with_error!(&env, ContractError::SubDaoNotConfigured);
-        }
-
-        // Verify token matches
-        if token != config.token {
+    /// Resume a continuous flow stream with specified rate
+    pub fn resume_continuous_flow(env: Env, stream_id: u64, flow_rate_per_second: i128) {
+        if flow_rate_per_second <= 0 {
             panic_with_error!(&env, ContractError::InvalidTokenAmount);
         }
-
-        // Check budget (simplified - in production would track properly)
-        if config.spent_budget >= config.allocated_budget {
-            panic_with_error!(&env, ContractError::SubDaoBudgetExceeded);
-        }
-
-        // Create the meter using standard logic
-        let meter_id = Self::register_meter_with_mode(
-            env,
-            user,
-            provider,
-            off_peak_rate,
-            token,
-            BillingType::PrePaid,
-            device_public_key,
-            priority_index,
-        );
-
-        // Update spent budget (simplified)
-        let mut updated_config = config;
-        updated_config.spent_budget += off_peak_rate; // Simplified accounting
-        env.storage().instance().set(&DataKey::SubDaoConfig(sub_dao), &updated_config);
-
-        env.events().publish(
-            (soroban_sdk::symbol_short!("SubDaoStr"), meter_id),
-            sub_dao,
-        );
-
-        meter_id
+        
+        update_flow_rate(&env, stream_id, flow_rate_per_second).unwrap();
     }
 
-    /// Recall funds from Sub-DAO (parent DAO only)
-    pub fn recall_sub_dao_funds(env: Env, sub_dao: Address, amount: i128) {
-        let parent_dao = env.current_contract_address();
-        parent_dao.require_auth();
-
-        let mut config: SubDaoConfig = env
-            .storage()
+    /// Get the current accumulated balance after flow calculation
+    pub fn get_continuous_balance(env: Env, stream_id: u64) -> Option<i128> {
+        if let Some(mut flow) = env.storage()
             .instance()
-            .get(&DataKey::SubDaoConfig(sub_dao.clone()))
-            .expect("Sub-DAO not configured");
-
-        if config.parent_dao != parent_dao {
-            panic_with_error!(&env, ContractError::NotParentDao);
-        }
-
-        // Reduce allocated budget
-        config.allocated_budget = config.allocated_budget.saturating_sub(amount);
-
-        env.storage().instance().set(&DataKey::SubDaoConfig(sub_dao), &config);
-
-        env.events().publish(
-            (symbol_short!("SubDaoR"),),
-            (sub_dao.clone(), amount, config.allocated_budget),
-        );
-    }
-
-    /// Deactivate Sub-DAO
-    pub fn deactivate_sub_dao(env: Env, sub_dao: Address) {
-        let parent_dao = env.current_contract_address();
-        parent_dao.require_auth();
-
-        let mut config: SubDaoConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::SubDaoConfig(sub_dao.clone()))
-            .expect("Sub-DAO not configured");
-
-        if config.parent_dao != parent_dao {
-            panic_with_error!(&env, ContractError::NotParentDao);
-        }
-
-        config.is_active = false;
-        env.storage().instance().set(&DataKey::SubDaoConfig(sub_dao), &config);
-
-        env.events().publish(
-            (soroban_sdk::symbol_short!("SubDaoOff"),),
-            sub_dao,
-        );
-    }
-
-    /// Get Sub-DAO config
-    pub fn get_sub_dao_config(env: Env, sub_dao: Address) -> SubDaoConfig {
-        env.storage()
-            .instance()
-            .get(&DataKey::SubDaoConfig(sub_dao))
-            .expect("Sub-DAO not configured")
-    }
-
-    // ============================================================================
-    // Issue #98: Multi-Sig Provider Withdrawal Requirement
-    // ============================================================================
-    // For large utility companies, a single wallet should not be able to pull
-    // millions in revenue. This implements a "Multi-Sig Payout" requirement where
-    // withdrawals from the contract to the company's main treasury require 3-of-5
-    // authorized signatures from "Finance Department" wallets.
-    // ============================================================================
-
-    /// Configure multi-sig withdrawal requirement for a provider.
-    /// This sets up the Finance Department wallets that can authorize large withdrawals.
-    ///
-    /// # Arguments
-    /// * `provider` - The utility provider address
-    /// * `finance_wallets` - Vector of authorized Finance Department wallet addresses (3-5 wallets)
-    /// * `required_signatures` - Number of signatures required (must be <= wallet count)
-    /// * `threshold_amount` - Minimum amount in USD cents requiring multi-sig approval
-    pub fn configure_multisig_withdrawal(
-        env: Env,
-        provider: Address,
-        finance_wallets: Vec<Address>,
-        required_signatures: u32,
-        threshold_amount: i128,
-    ) {
-        // Require provider authorization
-        provider.require_auth();
-
-        // Check if already configured
-        if env.storage().instance().has(&DataKey::MultiSigConfig(provider.clone())) {
-            panic_with_error!(&env, ContractError::MultiSigAlreadyConfigured);
-        }
-
-        // Validate wallet count (3-5 wallets required)
-        let wallet_count = finance_wallets.len();
-        if wallet_count < MIN_FINANCE_WALLETS || wallet_count > MAX_FINANCE_WALLETS {
-            panic_with_error!(&env, ContractError::InvalidFinanceWalletCount);
-        }
-
-        // Validate required signatures
-        if required_signatures == 0 || required_signatures > wallet_count {
-            panic_with_error!(&env, ContractError::InvalidSignatureThreshold);
-        }
-
-        let config = MultiSigConfig {
-            provider: provider.clone(),
-            finance_wallets,
-            required_signatures,
-            threshold_amount,
-            is_active: true,
-            created_at: env.ledger().timestamp(),
-        };
-
-        // Store configuration
-        env.storage().instance().set(&DataKey::MultiSigConfig(provider.clone()), &config);
-
-        // Initialize request counter
-        env.storage().instance().set(&DataKey::WithdrawalRequestCount(provider.clone()), &0u64);
-
-        env.events().publish(
-            (symbol_short!("MSigCfg"),),
-            (provider, required_signatures, threshold_amount),
-        );
-    }
-
-    /// Update multi-sig configuration for a provider.
-    /// Requires authorization from at least `required_signatures` current finance wallets.
-    pub fn update_multisig_config(
-        env: Env,
-        provider: Address,
-        new_finance_wallets: Vec<Address>,
-        new_required_signatures: u32,
-        new_threshold_amount: i128,
-    ) {
-        let config: MultiSigConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultiSigConfig(provider.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::MultiSigNotConfigured));
-
-        // Require authorization from the provider
-        provider.require_auth();
-
-        // Validate new wallet count
-        let wallet_count = new_finance_wallets.len();
-        if wallet_count < MIN_FINANCE_WALLETS || wallet_count > MAX_FINANCE_WALLETS {
-            panic_with_error!(&env, ContractError::InvalidFinanceWalletCount);
-        }
-
-let milestone = MaintenanceMilestone {
-            meter_id,
-            milestone_number,
-            description,
-            funding_amount,
-            is_completed: false,
-            completed_at: 0,
-            verified_by: verified_by.clone(),
-            completion_proof: Bytes::from_array(&env, &[0; 0]),
-        };
-
-        env.storage().instance().set(&DataKey::MultiSigConfig(provider.clone()), &updated_config);
-
-        env.events().publish(
-            (symbol_short!("MSigUpd"),),
-            (provider, new_required_signatures, new_threshold_amount),
-        );
-    }
-
-    /// Propose a multi-sig withdrawal request.
-    /// Only authorized Finance Department wallets can propose withdrawals.
-    ///
-    /// # Arguments
-    /// * `provider` - The utility provider address
-    /// * `meter_id` - The meter to withdraw earnings from
-    /// * `amount_usd_cents` - Amount to withdraw in USD cents
-    /// * `destination` - Treasury address to receive funds
-    ///
-    /// # Returns
-    /// The request ID for this withdrawal proposal
-    pub fn propose_multisig_withdrawal(
-        env: Env,
-        provider: Address,
-        meter_id: u64,
-        amount_usd_cents: i128,
-        destination: Address,
-    ) -> u64 {
-        let config: MultiSigConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultiSigConfig(provider.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::MultiSigNotConfigured));
-
-        if !config.is_active {
-            panic_with_error!(&env, ContractError::MultiSigNotConfigured);
-        }
-
-        // Verify the meter belongs to this provider
-        let meter = get_meter_or_panic(&env, meter_id);
-        if meter.provider != provider {
-            panic_with_error!(&env, ContractError::MeterNotFound);
-        }
-
-        // Check amount is above multi-sig threshold
-        if amount_usd_cents < config.threshold_amount {
-            panic_with_error!(&env, ContractError::AmountBelowMultiSigThreshold);
-        }
-
-        // Find the proposer from authorized finance wallets
-        let mut proposer: Option<Address> = None;
-        for i in 0..config.finance_wallets.len() {
-            let wallet = config.finance_wallets.get(i).unwrap();
-            // Try to require auth from each wallet - the one that authorized is the proposer
-            if env.try_invoke_contract::<(), _>(
-                &wallet,
-                &Symbol::new(&env, "require_auth"),
-                (),
-            ).is_ok() {
-                proposer = Some(wallet);
-                break;
-            }
-        }
-
-        // Alternative: Require explicit proposer parameter and verify they're authorized
-        // For now, we'll require any finance wallet to authorize
-        let mut found_proposer = false;
-        let mut actual_proposer = config.finance_wallets.get(0).unwrap();
-        for i in 0..config.finance_wallets.len() {
-            let wallet = config.finance_wallets.get(i).unwrap();
-            // Check if this wallet can authorize
-            wallet.require_auth();
-            actual_proposer = wallet;
-            found_proposer = true;
-            break;
-        }
-
-        if !found_proposer {
-            panic_with_error!(&env, ContractError::NotAuthorizedFinanceWallet);
-        }
-
-        // Get and increment request counter
-        let request_id: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::WithdrawalRequestCount(provider.clone()))
-            .unwrap_or(0);
-
-        let now = env.ledger().timestamp();
-
-        let request = WithdrawalRequest {
-            request_id,
-            provider: provider.clone(),
-            meter_id,
-            amount_usd_cents,
-            destination: destination.clone(),
-            proposer: actual_proposer.clone(),
-            created_at: now,
-            expires_at: now + WITHDRAWAL_REQUEST_EXPIRY,
-            approval_count: 1, // Proposer automatically approves
-            is_executed: false,
-            is_cancelled: false,
-        };
-
-        // Store the request
-        env.storage().instance().set(
-            &DataKey::WithdrawalRequest(provider.clone(), request_id),
-            &request,
-        );
-
-        // Record proposer's approval
-        env.storage().instance().set(
-            &DataKey::WithdrawalApproval(provider.clone(), request_id, actual_proposer.clone()),
-            &true,
-        );
-
-        // Increment counter
-        env.storage().instance().set(
-            &DataKey::WithdrawalRequestCount(provider.clone()),
-            &(request_id + 1),
-        );
-
-        env.events().publish(
-            (symbol_short!("MSigProp"),),
-            (provider, request_id, amount_usd_cents, destination, actual_proposer),
-        );
-
-        request_id
-    }
-
-    /// Approve a pending multi-sig withdrawal request.
-    /// Only authorized Finance Department wallets can approve.
-    ///
-    /// # Arguments
-    /// * `provider` - The utility provider address
-    /// * `request_id` - The withdrawal request ID to approve
-    pub fn approve_multisig_withdrawal(env: Env, provider: Address, request_id: u64) {
-        let config: MultiSigConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultiSigConfig(provider.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::MultiSigNotConfigured));
-
-        let mut request: WithdrawalRequest = env
-            .storage()
-            .instance()
-            .get(&DataKey::WithdrawalRequest(provider.clone(), request_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::WithdrawalRequestNotFound));
-
-        // Check request status
-        if request.is_executed {
-            panic_with_error!(&env, ContractError::WithdrawalAlreadyExecuted);
-        }
-        if request.is_cancelled {
-            panic_with_error!(&env, ContractError::WithdrawalAlreadyCancelled);
-        }
-        if env.ledger().timestamp() > request.expires_at {
-            panic_with_error!(&env, ContractError::WithdrawalRequestExpired);
-        }
-
-        // Find and verify the approver is an authorized finance wallet
-        let mut approver: Option<Address> = None;
-        for i in 0..config.finance_wallets.len() {
-            let wallet = config.finance_wallets.get(i).unwrap();
-            wallet.require_auth();
-            approver = Some(wallet);
-            break;
-        }
-
-        let actual_approver = approver.unwrap_or_else(|| {
-            panic_with_error!(&env, ContractError::NotAuthorizedFinanceWallet)
-        });
-
-        // Check if already approved by this wallet
-        let approval_key = DataKey::WithdrawalApproval(
-            provider.clone(),
-            request_id,
-            actual_approver.clone(),
-        );
-        if env.storage().instance().has(&approval_key) {
-            panic_with_error!(&env, ContractError::AlreadyApprovedWithdrawal);
-        }
-
-        // Record approval
-        env.storage().instance().set(&approval_key, &true);
-        request.approval_count += 1;
-
-        // Update request
-        env.storage().instance().set(
-            &DataKey::WithdrawalRequest(provider.clone(), request_id),
-            &request,
-        );
-
-        env.events().publish(
-            (symbol_short!("MSigAppr"),),
-            (provider, request_id, actual_approver, request.approval_count),
-        );
-    }
-
-    /// Execute a multi-sig withdrawal after sufficient approvals.
-    ///
-    /// # Arguments
-    /// * `provider` - The utility provider address
-    /// * `request_id` - The withdrawal request ID to execute
-    pub fn execute_multisig_withdrawal(env: Env, provider: Address, request_id: u64) {
-        let config: MultiSigConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultiSigConfig(provider.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::MultiSigNotConfigured));
-
-        let mut request: WithdrawalRequest = env
-            .storage()
-            .instance()
-            .get(&DataKey::WithdrawalRequest(provider.clone(), request_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::WithdrawalRequestNotFound));
-
-        // Check request status
-        if request.is_executed {
-            panic_with_error!(&env, ContractError::WithdrawalAlreadyExecuted);
-        }
-        if request.is_cancelled {
-            panic_with_error!(&env, ContractError::WithdrawalAlreadyCancelled);
-        }
-        if env.ledger().timestamp() > request.expires_at {
-            panic_with_error!(&env, ContractError::WithdrawalRequestExpired);
-        }
-
-        // Check sufficient approvals
-        if request.approval_count < config.required_signatures {
-            panic_with_error!(&env, ContractError::InsufficientApprovals);
-        }
-
-        // Get meter and verify
-        let mut meter = get_meter_or_panic(&env, request.meter_id);
-        if meter.provider != provider {
-            panic_with_error!(&env, ContractError::MeterNotFound);
-        }
-
-        // Store old meter value for pool update
-        let old_meter_value = provider_meter_value(&meter);
-
-        let available_earnings = match meter.billing_type {
-            BillingType::PrePaid => meter.balance,
-            BillingType::PostPaid => meter.debt,
-        };
-
-        if request.amount_usd_cents > available_earnings {
-            panic_with_error!(&env, ContractError::InvalidTokenAmount);
-        }
-
-        // Convert USD cents to XLM if needed
-        let withdrawal_amount = match convert_usd_to_token_if_needed(
-            &env,
-            request.amount_usd_cents,
-            &meter.token,
-        ) {
-            Ok(amount) => amount,
-            Err(_) => panic_with_error!(&env, ContractError::PriceConversionFailed),
-        };
-
-        // Execute the transfer to the destination treasury
-        let client = token::Client::new(&env, &meter.token);
-        client.transfer(
-            &env.current_contract_address(),
-            &request.destination,
-            &withdrawal_amount,
-        );
-
-        // Update meter balance/debt
-        match meter.billing_type {
-            BillingType::PrePaid => {
-                meter.balance = meter.balance.saturating_sub(request.amount_usd_cents);
-            }
-            BillingType::PostPaid => {
-                meter.debt = meter.debt.saturating_sub(request.amount_usd_cents);
-            }
-        }
-
-        let now = env.ledger().timestamp();
-        let was_active = meter.is_active;
-        refresh_activity(&mut meter, now);
-
-        if !was_active && meter.is_active {
-            meter.last_update = now;
-        }
-
-        // Update provider total pool
-        let new_meter_value = provider_meter_value(&meter);
-        update_provider_total_pool(&env, &meter.provider, old_meter_value, new_meter_value);
-
-        env.storage()
-            .instance()
-            .set(&DataKey::Meter(request.meter_id), &meter);
-
-        // Mark request as executed
-        request.is_executed = true;
-        env.storage().instance().set(
-            &DataKey::WithdrawalRequest(provider.clone(), request_id),
-            &request,
-        );
-
-        env.events().publish(
-            (symbol_short!("MSigExec"),),
-            (provider, request_id, request.amount_usd_cents, request.destination, withdrawal_amount),
-        );
-    }
-
-    /// Revoke a previously given approval for a withdrawal request.
-    ///
-    /// # Arguments
-    /// * `provider` - The utility provider address
-    /// * `request_id` - The withdrawal request ID
-    pub fn revoke_multisig_approval(env: Env, provider: Address, request_id: u64) {
-        let config: MultiSigConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultiSigConfig(provider.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::MultiSigNotConfigured));
-
-        let mut request: WithdrawalRequest = env
-            .storage()
-            .instance()
-            .get(&DataKey::WithdrawalRequest(provider.clone(), request_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::WithdrawalRequestNotFound));
-
-        // Check request is still pending
-        if request.is_executed {
-            panic_with_error!(&env, ContractError::WithdrawalAlreadyExecuted);
-        }
-        if request.is_cancelled {
-            panic_with_error!(&env, ContractError::WithdrawalAlreadyCancelled);
-        }
-
-        // Find and verify the revoker is an authorized finance wallet
-        let mut revoker: Option<Address> = None;
-        for i in 0..config.finance_wallets.len() {
-            let wallet = config.finance_wallets.get(i).unwrap();
-            wallet.require_auth();
-            revoker = Some(wallet);
-            break;
-        }
-
-        let actual_revoker = revoker.unwrap_or_else(|| {
-            panic_with_error!(&env, ContractError::NotAuthorizedFinanceWallet)
-        });
-
-        // Check if this wallet has approved
-        let approval_key = DataKey::WithdrawalApproval(
-            provider.clone(),
-            request_id,
-            actual_revoker.clone(),
-        );
-        if !env.storage().instance().has(&approval_key) {
-            panic_with_error!(&env, ContractError::NotApprovedByWallet);
-        }
-
-        // Remove approval
-        env.storage().instance().remove(&approval_key);
-        request.approval_count = request.approval_count.saturating_sub(1);
-
-        // Update request
-        env.storage().instance().set(
-            &DataKey::WithdrawalRequest(provider.clone(), request_id),
-            &request,
-        );
-
-        env.events().publish(
-            (symbol_short!("MSigRvke"),),
-            (provider, request_id, actual_revoker, request.approval_count),
-        );
-    }
-
-    /// Cancel a pending multi-sig withdrawal request.
-    /// Only the original proposer or provider can cancel.
-    ///
-    /// # Arguments
-    /// * `provider` - The utility provider address
-    /// * `request_id` - The withdrawal request ID to cancel
-    pub fn cancel_multisig_withdrawal(env: Env, provider: Address, request_id: u64) {
-        let mut request: WithdrawalRequest = env
-            .storage()
-            .instance()
-            .get(&DataKey::WithdrawalRequest(provider.clone(), request_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::WithdrawalRequestNotFound));
-
-        // Check request is still pending
-        if request.is_executed {
-            panic_with_error!(&env, ContractError::WithdrawalAlreadyExecuted);
-        }
-        if request.is_cancelled {
-            panic_with_error!(&env, ContractError::WithdrawalAlreadyCancelled);
-        }
-
-        // Either provider or proposer can cancel
-        // Try provider first
-        let is_provider = env.try_invoke_contract::<(), _>(
-            &provider,
-            &Symbol::new(&env, "require_auth"),
-            (),
-        ).is_ok();
-
-        if !is_provider {
-            // Try proposer
-            request.proposer.require_auth();
-        } else {
-            provider.require_auth();
-        }
-
-        // Mark as cancelled
-        request.is_cancelled = true;
-        env.storage().instance().set(
-            &DataKey::WithdrawalRequest(provider.clone(), request_id),
-            &request,
-        );
-
-        env.events().publish(
-            (symbol_short!("MSigCanc"),),
-            (provider, request_id),
-        );
-    }
-
-    /// Disable multi-sig requirement for a provider.
-    /// This allows returning to single-signature withdrawals.
-    /// Requires provider authorization.
-    pub fn disable_multisig(env: Env, provider: Address) {
-        provider.require_auth();
-
-        let mut config: MultiSigConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultiSigConfig(provider.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::MultiSigNotConfigured));
-
-        config.is_active = false;
-        env.storage().instance().set(&DataKey::MultiSigConfig(provider.clone()), &config);
-
-        env.events().publish(
-            (symbol_short!("MSigOff"),),
-            provider,
-        );
-    }
-
-    /// Re-enable multi-sig requirement for a provider.
-    pub fn enable_multisig(env: Env, provider: Address) {
-        provider.require_auth();
-
-        let mut config: MultiSigConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultiSigConfig(provider.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::MultiSigNotConfigured));
-
-        config.is_active = true;
-        env.storage().instance().set(&DataKey::MultiSigConfig(provider.clone()), &config);
-
-        env.events().publish(
-            (symbol_short!("MSigOn"),),
-            provider,
-        );
-    }
-
-    /// Get multi-sig configuration for a provider.
-    pub fn get_multisig_config(env: Env, provider: Address) -> MultiSigConfig {
-        env.storage()
-            .instance()
-            .get(&DataKey::MultiSigConfig(provider))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::MultiSigNotConfigured))
-    }
-
-    /// Get a specific withdrawal request.
-    pub fn get_withdrawal_request(env: Env, provider: Address, request_id: u64) -> WithdrawalRequest {
-        env.storage()
-            .instance()
-            .get(&DataKey::WithdrawalRequest(provider, request_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::WithdrawalRequestNotFound))
-    }
-
-    /// Check if a wallet has approved a specific withdrawal request.
-    pub fn has_approved_withdrawal(
-        env: Env,
-        provider: Address,
-        request_id: u64,
-        wallet: Address,
-    ) -> bool {
-        env.storage()
-            .instance()
-            .has(&DataKey::WithdrawalApproval(provider, request_id, wallet))
-    }
-
-    /// Check if a withdrawal amount requires multi-sig for a provider.
-    pub fn requires_multisig(env: Env, provider: Address, amount_usd_cents: i128) -> bool {
-        match env
-            .storage()
-            .instance()
-            .get::<_, MultiSigConfig>(&DataKey::MultiSigConfig(provider))
+            .get::<DataKey, ContinuousFlow>(&DataKey::ContinuousFlow(stream_id))
         {
-            Some(config) => config.is_active && amount_usd_cents >= config.threshold_amount,
-            None => false,
-        }
-    }
-
-    /// Get the current withdrawal request count for a provider.
-    pub fn get_withdrawal_request_count(env: Env, provider: Address) -> u64 {
-        env.storage()
-            .instance()
-            .get(&DataKey::WithdrawalRequestCount(provider))
-            .unwrap_or(0)
-    }
-
-    // ==================== ISSUE #118: ZK PRIVACY USAGE REPORTING ====================
-
-    /// Enable privacy mode for a meter (allows ZK-proof usage reporting)
-    pub fn enable_privacy_mode(env: Env, meter_id: u64) {
-        let meter = get_meter_or_panic(&env, meter_id);
-        meter.user.require_auth();
-
-        // Add meter to privacy-enabled set
-        let mut privacy_meters: Vec<u64> = env.storage()
-            .instance()
-            .get(&DataKey::ZKEnabledMeters)
-            .unwrap_or_else(|| Vec::new(&env));
-        
-        if !privacy_meters.contains(&meter_id) {
-            privacy_meters.push_back(meter_id);
-            env.storage().instance().set(&DataKey::ZKEnabledMeters, &privacy_meters);
-        }
-
-        // Initialize private billing status
-        let billing_status = PrivateBillingStatus {
-            meter_id,
-            billing_cycle: 1,
-            total_commitments: 0,
-            verified_proofs: 0,
-            last_verification: 0,
-            privacy_enabled: true,
-        };
-        env.storage().instance().set(&DataKey::PrivateBillingStatus(meter_id), &billing_status);
-
-        env.events().publish(
-            (symbol_short!("PrivacyOn"), meter_id),
-            meter.user.clone(),
-        );
-    }
-
-    /// Disable privacy mode for a meter
-    pub fn disable_privacy_mode(env: Env, meter_id: u64) {
-        let meter = get_meter_or_panic(&env, meter_id);
-        meter.user.require_auth();
-
-        // Remove meter from privacy-enabled set
-        let mut privacy_meters: Vec<u64> = env.storage()
-            .instance()
-            .get(&DataKey::ZKEnabledMeters)
-            .unwrap_or_else(|| Vec::new(&env));
-        
-        let mut new_meters = Vec::new(&env);
-        for id in privacy_meters.iter() {
-            if id != meter_id {
-                new_meters.push_back(id);
-            }
-        }
-        env.storage().instance().set(&DataKey::ZKEnabledMeters, &new_meters);
-
-        // Update billing status
-        if let Some(mut status) = env.storage().instance().get::<_, PrivateBillingStatus>(&DataKey::PrivateBillingStatus(meter_id)) {
-            status.privacy_enabled = false;
-            env.storage().instance().set(&DataKey::PrivateBillingStatus(meter_id), &status);
-        }
-
-        env.events().publish(
-            (symbol_short!("PrivacyOff"), meter_id),
-            meter.user.clone(),
-        );
-    }
-
-    /// Submit ZK usage report with commitment and nullifier
-    pub fn submit_zk_usage_report(
-        env: Env,
-        meter_id: u64,
-        commitment: BytesN<32>,
-        nullifier: BytesN<32>,
-        encrypted_usage: Bytes,
-        proof_hash: BytesN<32>,
-    ) {
-        let meter = get_meter_or_panic(&env, meter_id);
-        meter.user.require_auth();
-
-        // Check if privacy mode is enabled
-        let privacy_status: PrivateBillingStatus = env.storage()
-            .instance()
-            .get(&DataKey::PrivateBillingStatus(meter_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::PrivacyNotEnabled));
-        
-        if !privacy_status.privacy_enabled {
-            panic_with_error!(&env, ContractError::PrivacyNotEnabled);
-        }
-
-        // Check if nullifier has been used before (prevent double-spending)
-        if env.storage().instance().has(&DataKey::NullifierMap(nullifier.clone())) {
-            panic_with_error!(&env, ContractError::NullifierAlreadyUsed);
-        }
-
-        // Store nullifier to prevent reuse
-        env.storage().instance().set(&DataKey::NullifierMap(nullifier.clone()), &true);
-
-        // Create and store ZK usage report
-        let zk_report = ZKUsageReport {
-            commitment: commitment.clone(),
-            nullifier: nullifier.clone(),
-            encrypted_usage,
-            proof_hash,
-            meter_id,
-            billing_cycle: privacy_status.billing_cycle,
-            timestamp: env.ledger().timestamp(),
-            is_verified: false,
-        };
-
-        env.storage().instance().set(&DataKey::ZKUsageReport(meter_id, privacy_status.billing_cycle), &zk_report);
-
-        // Store commitment
-        env.storage().instance().set(&DataKey::ZKProof(commitment.clone()), &ZKProof {
-            commitment: commitment.clone(),
-            nullifier: nullifier.clone(),
-            proof: Bytes::new(&env),
-            meter_id,
-            timestamp: env.ledger().timestamp(),
-            is_valid: false,
-        });
-
-        // Update billing status
-        let mut updated_status = privacy_status.clone();
-        updated_status.total_commitments += 1;
-        env.storage().instance().set(&DataKey::PrivateBillingStatus(meter_id), &updated_status);
-
-        env.events().publish(
-            (symbol_short!("ZKReport"), meter_id),
-            (commitment, privacy_status.billing_cycle),
-        );
-    }
-
-    /// Get status of meter with privacy considerations
-    pub fn get_status(env: Env, meter_id: u64, requester: Address) -> MeterStatus {
-        let meter = get_meter_or_panic(&env, meter_id);
-        
-        // Check if privacy mode is enabled
-        let privacy_status: Option<PrivateBillingStatus> = env.storage()
-            .instance()
-            .get(&DataKey::PrivateBillingStatus(meter_id));
-
-        match privacy_status {
-            Some(status) if status.privacy_enabled => {
-                // Return privacy-preserving status
-                MeterStatus {
-                    meter_id,
-                    is_active: meter.is_active,
-                    balance: if requester == meter.user || requester == meter.provider {
-                        meter.balance
-                    } else {
-                        0 // Hide balance from unauthorized parties
-                    },
-                    billing_cycle: status.billing_cycle,
-                    total_commitments: status.total_commitments,
-                    verified_proofs: status.verified_proofs,
-                    privacy_enabled: true,
-                    last_update: meter.last_update,
-                    // Hide detailed usage data when privacy is enabled
-                    usage_summary: None,
-                }
-            }
-            _ => {
-                // Return full status when privacy is disabled
-                MeterStatus {
-                    meter_id,
-                    is_active: meter.is_active,
-                    balance: meter.balance,
-                    billing_cycle: 0,
-                    total_commitments: 0,
-                    verified_proofs: 0,
-                    privacy_enabled: false,
-                    last_update: meter.last_update,
-                    usage_summary: Some(meter.usage_data.clone()),
-                }
-            }
-        }
-    }
-
-    /// Verify ZK proof (placeholder for future full ZK implementation)
-    pub fn verify_zk_proof(env: Env, meter_id: u64, proof_hash: BytesN<32>) -> bool {
-        // Check if meter has privacy enabled
-        let privacy_status: PrivateBillingStatus = env.storage()
-            .instance()
-            .get(&DataKey::PrivateBillingStatus(meter_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::PrivacyNotEnabled));
-
-        if !privacy_status.privacy_enabled {
-            panic_with_error!(&env, ContractError::PrivacyNotEnabled);
-        }
-
-        // Check verification cache first
-        if let Some(cached_result) = env.storage().instance().get::<_, bool>(&DataKey::ZKVerificationCache(proof_hash)) {
-            return cached_result;
-        }
-
-        // For now, implement a simple verification (placeholder for full ZK-SNARK)
-        // In production, this would verify the actual ZK proof
-        let is_valid = verify_zk_proof_placeholder(&env, proof_hash);
-
-        // Cache the result
-        env.storage().instance().set(&DataKey::ZKVerificationCache(proof_hash), &is_valid);
-
-        if is_valid {
-            // Update verified proofs count
-            let mut updated_status = privacy_status;
-            updated_status.verified_proofs += 1;
-            updated_status.last_verification = env.ledger().timestamp();
-            env.storage().instance().set(&DataKey::PrivateBillingStatus(meter_id), &updated_status);
-
-            env.events().publish(
-                (symbol_short!("ZKVerified"), meter_id),
-                proof_hash,
-            );
-        }
-
-        is_valid
-    }
-
-    /// Get private billing status for a meter
-    pub fn get_private_billing_status(env: Env, meter_id: u64) -> PrivateBillingStatus {
-        env.storage()
-            .instance()
-            .get(&DataKey::PrivateBillingStatus(meter_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::PrivacyNotEnabled))
-    }
-
-    /// Check if a meter has privacy enabled
-    pub fn is_privacy_enabled(env: Env, meter_id: u64) -> bool {
-        if let Some(status) = env.storage().instance().get::<_, PrivateBillingStatus>(&DataKey::PrivateBillingStatus(meter_id)) {
-            status.privacy_enabled
+            let current_timestamp = env.ledger().timestamp();
+            let accumulation = calculate_flow_accumulation(&flow, current_timestamp);
+            let remaining_balance = flow.accumulated_balance.saturating_sub(accumulation);
+            
+            Some(remaining_balance)
         } else {
-            false
+            None
         }
     }
 }

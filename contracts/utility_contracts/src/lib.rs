@@ -31,7 +31,9 @@ mod fuzz_tests;
 #[cfg(test)]
 mod dust_sweeper_tests;
 #[cfg(test)]
-mod dust_sweeper_basic_tests;
+mod pause_resume_tests;
+#[cfg(test)]
+mod pause_resume_fuzz_tests;
 
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -58,7 +60,8 @@ pub struct ContinuousFlow {
     pub last_flow_timestamp: u64,   // 8 bytes - u64 for epoch safety
     pub created_timestamp: u64,     // 8 bytes - creation time
     pub status: StreamStatus,       // 1 byte (enum)
-    pub reserved: [u8; 7],         // 7 bytes - for future use/alignment
+    pub paused_at: u64,           // 8 bytes - timestamp when stream was paused (0 if active)
+    pub provider: Address,         // 32 bytes - provider address for access control
 }
 // Minimum balance required to keep the IoT relay open (500 tokens for testing)
 const MINIMUM_BALANCE_TO_FLOW: i128 = 500; // 500 tokens minimum for testing
@@ -154,6 +157,25 @@ pub struct StreamUpdatedEvent {
     pub timestamp: u64,
     pub old_status: StreamStatus,
     pub new_status: StreamStatus,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct StreamPausedEvent {
+    pub stream_id: u64,
+    pub paused_at: u64,
+    pub provider: Address,
+    pub remaining_balance: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct StreamResumedEvent {
+    pub stream_id: u64,
+    pub resumed_at: u64,
+    pub provider: Address,
+    pub flow_rate_per_second: i128,
+    pub pause_duration: u64,
 }
 
 #[contracttype]
@@ -600,6 +622,7 @@ fn create_continuous_flow(
     flow_rate_per_second: i128,
     initial_balance: i128,
     current_timestamp: u64,
+    provider: Address,
 ) -> ContinuousFlow {
     ContinuousFlow {
         stream_id,
@@ -608,7 +631,8 @@ fn create_continuous_flow(
         last_flow_timestamp: current_timestamp,
         created_timestamp: current_timestamp,
         status: if initial_balance > 0 { StreamStatus::Active } else { StreamStatus::Paused },
-        reserved: [0u8; 7],
+        paused_at: 0, // Not paused initially
+        provider,
     }
 }
 
@@ -666,6 +690,98 @@ fn update_continuous_flow(
     }
     
     Ok(accumulation)
+}
+
+/// Pause a continuous flow stream (provider only)
+/// Halts time-delta calculation immediately and records paused_at timestamp
+fn pause_stream(env: &Env, stream_id: u64, provider: &Address) -> Result<(), ContractError> {
+    let mut flow = get_continuous_flow_or_panic(env, stream_id);
+    
+    // Verify provider authorization
+    if flow.provider != *provider {
+        panic_with_error!(env, ContractError::UnauthorizedAdmin);
+    }
+    
+    // Only allow pausing active streams
+    if flow.status != StreamStatus::Active {
+        return Err(ContractError::InvalidTokenAmount); // Reuse error for invalid state
+    }
+    
+    let current_timestamp = env.ledger().timestamp();
+    
+    // Update flow calculation up to pause moment
+    update_continuous_flow(&mut flow, current_timestamp)?;
+    
+    // Set paused status and record timestamp
+    flow.status = StreamStatus::Paused;
+    flow.paused_at = current_timestamp;
+    flow.flow_rate_per_second = 0; // Stop the flow
+    
+    // Store updated flow
+    env.storage()
+        .instance()
+        .set(&DataKey::ContinuousFlow(stream_id), &flow);
+    
+    // Emit StreamPaused event
+    env.events().publish(
+        symbol_short!("StreamPaused"),
+        (stream_id, current_timestamp, provider.clone(), flow.accumulated_balance)
+    );
+    
+    Ok(())
+}
+
+/// Resume a continuous flow stream (provider only)
+/// Restarts the flow and adjusts timing based on pause duration
+fn resume_stream(env: &Env, stream_id: u64, new_flow_rate: i128, provider: &Address) -> Result<(), ContractError> {
+    if new_flow_rate <= 0 {
+        return Err(ContractError::InvalidTokenAmount);
+    }
+    
+    let mut flow = get_continuous_flow_or_panic(env, stream_id);
+    
+    // Verify provider authorization
+    if flow.provider != *provider {
+        panic_with_error!(env, ContractError::UnauthorizedAdmin);
+    }
+    
+    // Only allow resuming paused streams
+    if flow.status != StreamStatus::Paused {
+        return Err(ContractError::InvalidTokenAmount); // Reuse error for invalid state
+    }
+    
+    let current_timestamp = env.ledger().timestamp();
+    
+    // Calculate pause duration
+    let pause_duration = current_timestamp.saturating_sub(flow.paused_at);
+    
+    // Handle edge case: stream depleted exactly when paused
+    if flow.accumulated_balance == 0 {
+        flow.status = StreamStatus::Depleted;
+        env.storage()
+            .instance()
+            .set(&DataKey::ContinuousFlow(stream_id), &flow);
+        return Err(ContractError::InvalidTokenAmount); // Cannot resume depleted stream
+    }
+    
+    // Resume the stream with new flow rate
+    flow.status = StreamStatus::Active;
+    flow.flow_rate_per_second = new_flow_rate;
+    flow.last_flow_timestamp = current_timestamp; // Reset flow timestamp
+    flow.paused_at = 0; // Clear pause timestamp
+    
+    // Store updated flow
+    env.storage()
+        .instance()
+        .set(&DataKey::ContinuousFlow(stream_id), &flow);
+    
+    // Emit StreamResumed event
+    env.events().publish(
+        symbol_short!("StreamResumed"),
+        (stream_id, current_timestamp, provider.clone(), new_flow_rate, pause_duration)
+    );
+    
+    Ok(())
 }
 
 /// Update flow rate with authentication and event emission
@@ -1640,15 +1756,16 @@ impl UtilityContract {
         stream_id: u64,
         flow_rate_per_second: i128,
         initial_balance: i128,
+        provider: Address,
     ) {
-        env.current_contract_address().require_auth();
+        provider.require_auth(); // Provider must authorize stream creation
         
         if flow_rate_per_second < 0 || initial_balance < 0 {
             panic_with_error!(&env, ContractError::InvalidTokenAmount);
         }
         
         let current_timestamp = env.ledger().timestamp();
-        let flow = create_continuous_flow(stream_id, flow_rate_per_second, initial_balance, current_timestamp);
+        let flow = create_continuous_flow(stream_id, flow_rate_per_second, initial_balance, current_timestamp, provider.clone());
         
         env.storage()
             .instance()
@@ -1656,7 +1773,7 @@ impl UtilityContract {
         
         env.events().publish(
             symbol_short!("StreamCreated"),
-            (stream_id, flow_rate_per_second, initial_balance, current_timestamp)
+            (stream_id, flow_rate_per_second, initial_balance, current_timestamp, provider)
         );
     }
 
@@ -1723,18 +1840,18 @@ impl UtilityContract {
         }
     }
 
-    /// Pause a continuous flow stream
-    pub fn pause_continuous_flow(env: Env, stream_id: u64) {
-        update_flow_rate(&env, stream_id, 0).unwrap();
+    /// Pause a continuous flow stream (provider only)
+    /// Halts time-delta calculation immediately and records paused_at timestamp
+    pub fn pause_stream(env: Env, stream_id: u64) {
+        let provider = env.invoker(); // Use invoker as provider
+        pause_stream(&env, stream_id, &provider).unwrap();
     }
 
-    /// Resume a continuous flow stream with specified rate
-    pub fn resume_continuous_flow(env: Env, stream_id: u64, flow_rate_per_second: i128) {
-        if flow_rate_per_second <= 0 {
-            panic_with_error!(&env, ContractError::InvalidTokenAmount);
-        }
-        
-        update_flow_rate(&env, stream_id, flow_rate_per_second).unwrap();
+    /// Resume a continuous flow stream (provider only)
+    /// Restarts the flow and adjusts timing based on pause duration
+    pub fn resume_stream(env: Env, stream_id: u64, flow_rate_per_second: i128) {
+        let provider = env.invoker(); // Use invoker as provider
+        resume_stream(&env, stream_id, flow_rate_per_second, &provider).unwrap();
     }
 
     /// Get the current accumulated balance after flow calculation

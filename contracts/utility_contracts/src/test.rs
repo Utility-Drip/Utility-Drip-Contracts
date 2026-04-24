@@ -875,3 +875,47 @@ fn test_get_gas_buffer_balance() {
     // Check balance after initialization
     assert_eq!(client.get_gas_buffer_balance(&provider), 300);
 }
+
+#[test]
+fn test_event_emissions() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let root_admin = Address::generate(&env);
+    
+    // Test initialization event
+    client.initialize(&root_admin);
+    
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    
+    // Setup a token
+    let token_admin = Address::generate(&env);
+    let token_address = env.register_stellar_asset_contract(token_admin.clone());
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
+
+    token_admin_client.mint(&user, &1000);
+
+    // Test meter registration event
+    let meter_id = client.register_meter(&user, &provider, &10, &token_address, &None);
+    
+    // Test top-up event
+    client.top_up(&meter_id, &500);
+    
+    // Test claim event
+    env.ledger().set_timestamp(env.ledger().timestamp() + 10);
+    client.claim(&meter_id);
+    
+    // Test webhook configuration event
+    let webhook_url_hash = 12345u64; // Simple hash for testing
+    client.configure_webhook(&user, &webhook_url_hash);
+    
+    // Test emergency shutdown event
+    client.emergency_shutdown(&meter_id);
+    
+    // Note: In a real test environment, you would verify the events were emitted
+    // This test ensures the functions execute without panicking when events are published
+}

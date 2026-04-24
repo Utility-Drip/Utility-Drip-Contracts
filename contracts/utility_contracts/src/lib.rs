@@ -421,68 +421,24 @@ pub struct WithdrawalRequest {
 
 #[contracttype]
 #[derive(Clone)]
-pub struct StreamUpdatedEvent {
-    pub stream_id: u64,
-    pub old_flow_rate: i128,
-    pub new_flow_rate: i128,
-    pub timestamp: u64,
-    pub old_status: StreamStatus,
-    pub new_status: StreamStatus,
+pub struct FeeChangeProposal {
+    pub proposal_id: u64,
+    pub proposed_fee_bps: i128,
+    pub proposed_at: u64,
+    pub voting_deadline: u64,
+    pub votes_for: i128,
+    pub votes_against: i128,
+    pub is_executed: bool,
+    pub proposer: Address,
 }
 
 #[contracttype]
 #[derive(Clone)]
-pub struct StreamPausedEvent {
-    pub stream_id: u64,
-    pub paused_at: u64,
+pub struct GasBuffer {
+    pub balance: i128,
+    pub last_top_up: u64,
     pub provider: Address,
-    pub remaining_balance: i128,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct StreamResumedEvent {
-    pub stream_id: u64,
-    pub resumed_at: u64,
-    pub provider: Address,
-    pub flow_rate_per_second: i128,
-    pub pause_duration: u64,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct BufferWarningEvent {
-    pub stream_id: u64,
-    pub warning_timestamp: u64,
-    pub buffer_remaining: i128,
-    pub provider: Address,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct BufferDepletedEvent {
-    pub stream_id: u64,
-    pub depleted_timestamp: u64,
-    pub buffer_consumed: i128,
-    pub provider: Address,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct DustCollectedEvent {
-    pub token_address: Address,
-    pub total_dust_swept: i128,
-    pub streams_swept: u64,
-    pub timestamp: u64,
-    pub sweeper_address: Address,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct DustAggregation {
-    pub total_dust: i128,
-    pub stream_count: u64,
-    pub last_updated: u64,
+    pub token: Address,
 }
 
 // Issue #178: Firmware Update Authorization Gate
@@ -529,6 +485,7 @@ pub enum DataKey {
     Meter(u64),
     Count,
     Oracle,
+    GasBuffer(Address),
     ActiveMetersCount,
     SeasonalFactor,
     Treasury,
@@ -543,13 +500,47 @@ pub enum DataKey {
     Referral(Address),
     PollVotes(Symbol),
     UserVoted(Address, Symbol),
-    Admin,
-    Role(Address),
-    NonReentrant,
-    IdentityContract,
-    Dispute(u64),
-    DisputeCount,
-    DisputeBondAmount,
+    BillingGroup(Address),
+    WebhookConfig(Address),
+    LastAlert(u64),
+    ClosingFeeBps,
+    Contributor(u64, Address),
+    AuthorizedContributor(u64, Address),
+    // Task #2: Tax Compliance
+    GovernmentVault(Address),
+    TaxRateBps, // Tax rate in basis points (e.g., 500 = 5%)
+    // Task #3: Self-Maintenance
+    MaintenanceFund(u64), // Per-meter maintenance fund balance
+    AutoExtendThreshold, // Ledger threshold for auto-extension
+    // Task #4: Wasm Hash Rotation
+    ProposedUpgrade,
+    UpgradeProposalTime,
+    VetoDeadline,
+    UserVetoed(Address, u64), // Address and proposal ID
+    // NEW TASKS:
+    // Task #1: Admin Transfer
+    CurrentAdmin,
+    AdminTransferProposal,
+    AdminVeto(Address, u64), // Address and proposal timestamp
+    ActiveUsers, // For tracking active users for voting
+    // Task #2: Legal Freeze
+    ComplianceOfficer,
+    ComplianceCouncil,
+    LegalFreeze(u64),
+    LegalVault,
+    // Task #3: Verified Provider Registry
+    VerifiedProvider(Address),
+    // Task #4: Sub-DAO
+    SubDaoConfig(Address),
+    // Issue #98: Multi-Sig Provider Withdrawal
+    MultiSigConfig(Address),           // Provider address -> MultiSigConfig
+    WithdrawalRequest(Address, u64),   // Provider address, request ID -> WithdrawalRequest
+    WithdrawalRequestCount(Address),   // Provider address -> request counter
+    WithdrawalApproval(Address, u64, Address), // Provider, request ID, signer -> bool
+    // Task #104: Usage-Based Governance
+    FeeChangeProposal(u64),
+    FeeChangeVote(Address, u64),
+    FeeProposalCount,
 }
 
 #[contracterror]
@@ -559,6 +550,7 @@ pub enum ContractError {
     MeterNotFound = 1,
     OracleNotSet = 2,
     WithdrawalLimitExceeded = 3,
+    InsufficientGasBuffer = 4,
     PriceConversionFailed = 4,
     InvalidTokenAmount = 5,
     InvalidUsageValue = 6,
@@ -607,6 +599,21 @@ const MAX_USAGE_PER_UPDATE: i128 = 1_000_000_000_000i128; // 1 billion kWh max p
 const MIN_PRECISION_FACTOR: i128 = 1;
 const MAX_TIMESTAMP_DELAY: u64 = 300; // 5 minutes
 
+// Gas buffer constants
+const MIN_GAS_BUFFER: i128 = 100;      // Minimum XLM to maintain as gas buffer
+const MAX_GAS_BUFFER: i128 = 10000;    // Maximum XLM that can be stored in gas buffer
+const GAS_BUFFER_TOP_UP_THRESHOLD: i128 = 200;  // Auto-top up when buffer falls below this
+
+fn get_meter_or_panic(env: &Env, meter_id: u64) -> Meter {
+    match env
+        .storage()
+        .instance()
+        .get::<DataKey, Meter>(&DataKey::Meter(meter_id))
+    {
+        Some(meter) => meter,
+        None => panic_with_error!(env, ContractError::MeterNotFound),
+    }
+}
 // Peak hours: 18:00 - 21:00 UTC
 const PEAK_HOUR_START: u64 = 18 * HOUR_IN_SECONDS; // 64800 seconds
 const PEAK_HOUR_END: u64 = 21 * HOUR_IN_SECONDS; // 75600 seconds
@@ -705,6 +712,48 @@ fn convert_usd_to_token_if_needed(_env: &Env, usd_cents: i128, _destination_toke
     Ok(usd_cents)
 }
 
+fn get_gas_buffer_or_default(env: &Env, provider: &Address, token: &Address) -> GasBuffer {
+    env.storage()
+        .instance()
+        .get(&DataKey::GasBuffer(provider.clone()))
+        .unwrap_or(GasBuffer {
+            balance: 0,
+            last_top_up: 0,
+            provider: provider.clone(),
+            token: token.clone(),
+        })
+}
+
+fn update_gas_buffer(env: &Env, gas_buffer: &GasBuffer) {
+    env.storage()
+        .instance()
+        .set(&DataKey::GasBuffer(gas_buffer.provider.clone()), gas_buffer);
+}
+
+fn should_use_gas_buffer(env: &Env, provider: &Address, amount: i128) -> bool {
+    // Check if provider has a gas buffer with sufficient balance
+    if let Some(gas_buffer) = env.storage().instance().get::<DataKey, GasBuffer>(&DataKey::GasBuffer(provider.clone())) {
+        // Use gas buffer if regular transfer might fail due to high fees
+        // This is a simplified heuristic - in production, you'd want to check actual network fees
+        gas_buffer.balance >= MIN_GAS_BUFFER && amount > 0
+    } else {
+        false
+    }
+}
+
+fn deduct_from_gas_buffer(env: &Env, provider: &Address, amount: i128) -> Result<(), ContractError> {
+    let mut gas_buffer = get_gas_buffer_or_default(env, provider, &Address::generate(env)); // Token address not needed for gas buffer
+    
+    if gas_buffer.balance < amount {
+        return Err(ContractError::InsufficientGasBuffer);
+    }
+    
+    gas_buffer.balance = gas_buffer.balance.saturating_sub(amount);
+    update_gas_buffer(env, &gas_buffer);
+    Ok(())
+}
+
+fn apply_provider_withdrawal_limit(
 
 // --- Internal Settlement Logic ---
 
@@ -783,6 +832,38 @@ fn settle_claim_for_meter(
         return ClaimSettlement { gross_claimed: 0, provider_payout: 0, tax_amount: 0, protocol_fee: 0, reseller_payout: 0 };
     }
 
+    let client = token::Client::new(env, &meter.token);
+    
+    // Check if we should use gas buffer for this transfer
+    if should_use_gas_buffer(env, &meter.provider, amount) {
+        // Use gas buffer to ensure transaction succeeds during high fee periods
+        // In a real implementation, this would involve more complex fee estimation
+        // For now, we'll still do the transfer but mark it as gas-buffer-supported
+        match deduct_from_gas_buffer(env, &meter.provider, MIN_GAS_BUFFER) {
+            Ok(()) => {
+                // Gas buffer deduction successful, proceed with transfer
+                client.transfer(&env.current_contract_address(), &meter.provider, &amount);
+                
+                // Emit event indicating gas buffer was used
+                env.events()
+                    .publish((symbol_short!("GasBufferUsed"), meter.provider.clone()), amount);
+            }
+            Err(_) => {
+                // Insufficient gas buffer, attempt regular transfer
+                client.transfer(&env.current_contract_address(), &meter.provider, &amount);
+            }
+        }
+    } else {
+        // No gas buffer or not needed, use regular transfer
+        client.transfer(&env.current_contract_address(), &meter.provider, &amount);
+    }
+
+    match meter.billing_type {
+        BillingType::PrePaid => {
+            meter.balance = meter.balance.saturating_sub(amount);
+        }
+        BillingType::PostPaid => {
+            meter.debt = meter.debt.saturating_add(amount);
 /// KYC Helpers
 fn check_kyc(env: &Env, account: &Address) {
     if let Some(identity_address) = env.storage().instance().get::<DataKey, Address>(&DataKey::IdentityContract) {
@@ -5735,6 +5816,95 @@ env.storage()
         } else {
             false
         }
+    }
+
+    // Gas Buffer Management Functions
+    
+    pub fn initialize_gas_buffer(env: Env, provider: Address, token: Address, initial_amount: i128) {
+        provider.require_auth();
+        
+        if initial_amount < MIN_GAS_BUFFER || initial_amount > MAX_GAS_BUFFER {
+            panic_with_error!(env, ContractError::InsufficientGasBuffer);
+        }
+        
+        let now = env.ledger().timestamp();
+        let gas_buffer = GasBuffer {
+            balance: initial_amount,
+            last_top_up: now,
+            provider: provider.clone(),
+            token: token.clone(),
+        };
+        
+        // Transfer initial amount from provider to contract
+        let client = token::Client::new(&env, &token);
+        client.transfer(&provider, &env.current_contract_address(), &initial_amount);
+        
+        update_gas_buffer(&env, &gas_buffer);
+        
+        env.events()
+            .publish((symbol_short!("GasBufferInit"), provider), initial_amount);
+    }
+    
+    pub fn top_up_gas_buffer(env: Env, provider: Address, token: Address, amount: i128) {
+        provider.require_auth();
+        
+        let mut gas_buffer = get_gas_buffer_or_default(&env, &provider, &token);
+        
+        if gas_buffer.balance.saturating_add(amount) > MAX_GAS_BUFFER {
+            panic_with_error!(env, ContractError::InsufficientGasBuffer);
+        }
+        
+        let now = env.ledger().timestamp();
+        
+        // Transfer top-up amount from provider to contract
+        let client = token::Client::new(&env, &token);
+        client.transfer(&provider, &env.current_contract_address(), &amount);
+        
+        gas_buffer.balance = gas_buffer.balance.saturating_add(amount);
+        gas_buffer.last_top_up = now;
+        
+        update_gas_buffer(&env, &gas_buffer);
+        
+        env.events()
+            .publish((symbol_short!("GasBufferTopUp"), provider), amount);
+    }
+    
+    pub fn withdraw_from_gas_buffer(env: Env, provider: Address, token: Address, amount: i128) {
+        provider.require_auth();
+        
+        let mut gas_buffer = get_gas_buffer_or_default(&env, &provider, &token);
+        
+        if gas_buffer.balance < amount {
+            panic_with_error!(env, ContractError::InsufficientGasBuffer);
+        }
+        
+        // Ensure minimum buffer is maintained
+        if gas_buffer.balance.saturating_sub(amount) < MIN_GAS_BUFFER {
+            panic_with_error!(env, ContractError::InsufficientGasBuffer);
+        }
+        
+        let client = token::Client::new(&env, &token);
+        client.transfer(&env.current_contract_address(), &provider, &amount);
+        
+        gas_buffer.balance = gas_buffer.balance.saturating_sub(amount);
+        update_gas_buffer(&env, &gas_buffer);
+        
+        env.events()
+            .publish((symbol_short!("GasBufferWithdraw"), provider), amount);
+    }
+    
+    pub fn get_gas_buffer(env: Env, provider: Address) -> Option<GasBuffer> {
+        env.storage()
+            .instance()
+            .get(&DataKey::GasBuffer(provider))
+    }
+    
+    pub fn get_gas_buffer_balance(env: Env, provider: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get::<DataKey, GasBuffer>(&DataKey::GasBuffer(provider))
+            .map(|buffer| buffer.balance)
+            .unwrap_or(0)
     }
 }
 

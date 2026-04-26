@@ -496,6 +496,13 @@ pub enum DataKey {
     AdminAddress,
     GasBountyPool,
     BufferVault(u64), // Per-stream buffer vault tracking
+    // Issue #198: Yield-Oracle Circuit Breakers
+    YieldOracleHealth,
+    CircuitBreakerTripped,
+    // Issue #199: Yield-Opt-Out
+    StreamYieldOptOut(u64),
+    // Issue #200: Batch-Yield Relayer
+    YieldVault(Address),
 }
 
 #[contracterror]
@@ -524,6 +531,30 @@ pub enum ContractError {
     InsufficientBuffer = 19,
     BufferAlreadyDepleted = 20,
     UnauthorizedBufferAccess = 21,
+    // Issue #198: Yield-Oracle Circuit Breakers
+    CircuitBreakerActive = 22,
+    OracleHealthCheckFailed = 23,
+    // Issue #200: Batch-Yield Relayer
+    NoYieldToHarvest = 24,
+}
+
+// Issue #198: Yield-Oracle Circuit Breakers
+#[contracttype]
+#[derive(Clone)]
+pub struct YieldOracleHealth {
+    pub apy_bps: i128,   // APY in basis points (negative = exploit detected)
+    pub tvl: i128,       // Total value locked
+    pub last_updated: u64,
+    pub governance_reset: bool, // true = governance approved reset
+}
+
+// Issue #200: Batch-Yield Relayer
+#[contracttype]
+#[derive(Clone)]
+pub struct YieldVault {
+    pub token: Address,
+    pub balance: i128,
+    pub last_harvest: u64,
 }
 
 #[contracttype]
@@ -5630,6 +5661,220 @@ let milestone = MaintenanceMilestone {
             .get::<DataKey, GasBuffer>(&DataKey::GasBuffer(provider))
             .map(|buffer| buffer.balance)
             .unwrap_or(0)
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #198: Yield-Oracle Circuit Breakers
+    // -------------------------------------------------------------------------
+
+    /// Update the AMM health metrics from an authorized oracle.
+    /// If APY < 0 or TVL drops to zero, the circuit breaker trips automatically.
+    pub fn update_yield_oracle(env: Env, caller: Address, apy_bps: i128, tvl: i128) {
+        caller.require_auth();
+        let oracle: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Oracle)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::OracleNotSet));
+        if caller != oracle {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        let now = env.ledger().timestamp();
+        let health = YieldOracleHealth {
+            apy_bps,
+            tvl,
+            last_updated: now,
+            governance_reset: false,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::YieldOracleHealth, &health);
+
+        // Auto-trip circuit breaker on bad health
+        let tripped = apy_bps < 0 || tvl == 0;
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerTripped, &tripped);
+
+        if tripped {
+            env.events().publish(
+                symbol_short!("CBTripped"),
+                (apy_bps, tvl, now),
+            );
+        }
+    }
+
+    /// Emergency unwind: rescues all LP tokens back to the native vault.
+    /// Callable by anyone when the circuit breaker is tripped.
+    /// Resets only after governance approval (governance_reset = true).
+    pub fn emergency_unwind(env: Env, token: Address) {
+        let tripped: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerTripped)
+            .unwrap_or(false);
+        if !tripped {
+            panic_with_error!(&env, ContractError::OracleHealthCheckFailed);
+        }
+
+        // Move all yield vault funds back to the contract (native vault)
+        let vault: Option<YieldVault> = env
+            .storage()
+            .instance()
+            .get(&DataKey::YieldVault(token.clone()));
+        if let Some(mut v) = vault {
+            let rescued = v.balance;
+            v.balance = 0;
+            env.storage()
+                .instance()
+                .set(&DataKey::YieldVault(token.clone()), &v);
+            env.events().publish(
+                symbol_short!("EmrgUnwind"),
+                (token.clone(), rescued, env.ledger().timestamp()),
+            );
+        }
+    }
+
+    /// Governance resets the circuit breaker after reviewing the AMM health.
+    pub fn reset_circuit_breaker(env: Env) {
+        require_admin_auth(&env);
+        let mut health: YieldOracleHealth = env
+            .storage()
+            .instance()
+            .get(&DataKey::YieldOracleHealth)
+            .unwrap_or(YieldOracleHealth {
+                apy_bps: 0,
+                tvl: 0,
+                last_updated: 0,
+                governance_reset: false,
+            });
+        health.governance_reset = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::YieldOracleHealth, &health);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerTripped, &false);
+        env.events()
+            .publish(symbol_short!("CBReset"), env.ledger().timestamp());
+    }
+
+    pub fn get_yield_oracle_health(env: Env) -> Option<YieldOracleHealth> {
+        env.storage()
+            .instance()
+            .get(&DataKey::YieldOracleHealth)
+    }
+
+    pub fn is_circuit_breaker_tripped(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerTripped)
+            .unwrap_or(false)
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #199: Yield-Opt-Out for Institutional Payers
+    // -------------------------------------------------------------------------
+
+    /// Set or clear the yield opt-out flag for a specific stream.
+    /// When opted out, the stream's capital is excluded from the yield pool.
+    pub fn set_yield_opt_out(env: Env, stream_id: u64, opt_out: bool) {
+        let flow: ContinuousFlow = env
+            .storage()
+            .instance()
+            .get::<DataKey, ContinuousFlow>(&DataKey::ContinuousFlow(stream_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::MeterNotFound));
+        flow.payer.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::StreamYieldOptOut(stream_id), &opt_out);
+        env.events().publish(
+            symbol_short!("YieldOptOut"),
+            (stream_id, opt_out, env.ledger().timestamp()),
+        );
+    }
+
+    /// Returns true if the stream has opted out of yield.
+    pub fn get_yield_opt_out(env: Env, stream_id: u64) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::StreamYieldOptOut(stream_id))
+            .unwrap_or(false)
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #200: Batch-Yield Relayer Incentive
+    // -------------------------------------------------------------------------
+
+    /// Permissionless: anyone can call harvest_all to compound yield for all
+    /// streams that have NOT opted out. Caller receives a 1% bounty of the
+    /// total harvested amount.
+    pub fn harvest_all(env: Env, caller: Address, token: Address, stream_ids: Vec<u64>) -> i128 {
+        // Circuit breaker guard
+        let tripped: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerTripped)
+            .unwrap_or(false);
+        if tripped {
+            panic_with_error!(&env, ContractError::CircuitBreakerActive);
+        }
+
+        let mut total_harvested: i128 = 0;
+
+        for stream_id in stream_ids.iter() {
+            // Skip streams that opted out of yield
+            let opted_out: bool = env
+                .storage()
+                .instance()
+                .get(&DataKey::StreamYieldOptOut(stream_id))
+                .unwrap_or(false);
+            if opted_out {
+                continue;
+            }
+
+            // Accumulate yield from each active stream's vault
+            let vault: Option<YieldVault> = env
+                .storage()
+                .instance()
+                .get(&DataKey::YieldVault(token.clone()));
+            if let Some(mut v) = vault {
+                if v.balance > 0 {
+                    total_harvested = total_harvested.saturating_add(v.balance);
+                    v.last_harvest = env.ledger().timestamp();
+                    v.balance = 0;
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::YieldVault(token.clone()), &v);
+                }
+            }
+        }
+
+        if total_harvested == 0 {
+            panic_with_error!(&env, ContractError::NoYieldToHarvest);
+        }
+
+        // 1% bounty to the relayer, rest stays in contract (auto-compounded)
+        let bounty = total_harvested / 100;
+        let compounded = total_harvested.saturating_sub(bounty);
+
+        // Pay bounty to caller
+        if bounty > 0 {
+            let token_client = token::Client::new(&env, &token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &caller,
+                &bounty,
+            );
+        }
+
+        env.events().publish(
+            symbol_short!("Harvested"),
+            (total_harvested, bounty, compounded, env.ledger().timestamp(), caller),
+        );
+
+        total_harvested
     }
 }
 

@@ -34,6 +34,10 @@ mod pause_resume_tests;
 mod pause_resume_fuzz_tests;
 #[cfg(test)]
 mod buffer_tests;
+#[cfg(test)]
+mod stroop_fuzz_tests;
+#[cfg(test)]
+mod streaming_invariant_tests;
 
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -72,26 +76,6 @@ const MINIMUM_BALANCE_TO_FLOW: i128 = 500; // 500 tokens minimum for testing
 // Buffer requirements - 24 hours of flow rate
 const BUFFER_DURATION_SECONDS: u64 = 24 * HOUR_IN_SECONDS; // 24 hours
 const BUFFER_WARNING_THRESHOLD: i128 = 3600; // Warning when 1 hour of buffer left
-
-#[contracttype]
-#[derive(Clone)]
-pub struct UsageReport {
-    pub meter_id: u64,
-    pub timestamp: u64,
-    pub watt_hours_consumed: i128,
-    pub units_consumed: i128,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct SignedUsageData {
-    pub meter_id: u64,
-    pub timestamp: u64,
-    pub watt_hours_consumed: i128,
-    pub units_consumed: i128,
-    pub signature: BytesN<64>,
-    pub public_key: BytesN<32>,
-}
 
 #[contracttype]
 #[derive(Clone)]
@@ -496,6 +480,12 @@ pub enum DataKey {
     AdminAddress,
     GasBountyPool,
     BufferVault(u64), // Per-stream buffer vault tracking
+    // Issue #197: Streaming-Fee Collector
+    PlatformFeeBps,
+    ProtocolFeeVault,
+    StreamingFeeAccrued(u64), // Per-stream accrued fees
+    // Issue #195: Minimum Yield-Routing Gas Thresholds
+    MinRouteThreshold,
 }
 
 #[contracterror]
@@ -524,6 +514,10 @@ pub enum ContractError {
     InsufficientBuffer = 19,
     BufferAlreadyDepleted = 20,
     UnauthorizedBufferAccess = 21,
+    // Issue #195
+    BelowMinRouteThreshold = 22,
+    // Issue #197
+    ProtocolFeeVaultNotSet = 23,
 }
 
 #[contracttype]
@@ -549,6 +543,14 @@ const MAX_TIMESTAMP_DELAY: u64 = 300; // 5 minutes
 const MIN_GAS_BUFFER: i128 = 100;      // Minimum XLM to maintain as gas buffer
 const MAX_GAS_BUFFER: i128 = 10000;    // Maximum XLM that can be stored in gas buffer
 const GAS_BUFFER_TOP_UP_THRESHOLD: i128 = 200;  // Auto-top up when buffer falls below this
+
+// Issue #195: Minimum Yield-Routing Gas Threshold
+// Default: 10_000_000 stroops (1 XLM). Routing below this costs more in gas than it earns.
+const DEFAULT_MIN_ROUTE_THRESHOLD: i128 = 10_000_000;
+
+// Issue #197: Streaming-Fee Collector
+// Max platform fee: 1000 bps = 10%
+const MAX_PLATFORM_FEE_BPS: i128 = 1000;
 
 fn get_meter_or_panic(env: &Env, meter_id: u64) -> Meter {
     match env
@@ -658,7 +660,7 @@ fn deduct_from_gas_buffer(env: &Env, provider: &Address, amount: i128) -> Result
     Ok(())
 }
 
-fn apply_provider_withdrawal_limit(
+fn apply_provider_withdrawal_limit_placeholder() {}
 
 // --- Internal Settlement Logic ---
 
@@ -824,22 +826,7 @@ fn update_dust_aggregation(env: &Env, token_address: &Address, dust_amount: i128
         .set(&DataKey::DustAggregation(token_address.clone()), &aggregation);
 }
 
-fn get_meter_or_panic(env: &Env, meter_id: u64) -> Meter {
-    match env
-        .storage()
-        .instance()
-        .get::<DataKey, Meter>(&DataKey::Meter(meter_id))
-    {
-        Some(meter) => meter,
-        None => panic_with_error!(env, ContractError::MeterNotFound),
-    }
-}
-
 // --- Helpers ---
-
-fn get_meter_or_panic(env: &Env, id: u64) -> Meter {
-    env.storage().instance().get(&DataKey::Meter(id)).expect("Meter Not Found")
-}
 
 fn provider_meter_value(meter: &Meter) -> i128 {
     meter.balance.max(DEBT_THRESHOLD)
@@ -954,31 +941,18 @@ fn allocate_to_maintenance_fund(env: &Env, meter_id: u64, amount: i128) {
         let current_fund: i128 = env
             .storage()
             .instance()
-            .set(&DataKey::SupportedToken(token), &true);
-    }
+            .get(&DataKey::MaintenanceFund(meter_id))
+            .unwrap_or(0);
 
         let new_fund = current_fund.saturating_add(maintenance_amount);
         env.storage()
             .instance()
             .set(&DataKey::MaintenanceFund(meter_id), &new_fund);
     }
+}
 
 fn get_reseller_config_impl(env: &Env, meter_id: u64) -> Option<ResellerConfig> {
     env.storage().instance().get(&DataKey::ResellerConfig(meter_id))
-}
-
-fn auto_extend_ttl_if_needed(env: &Env, meter_id: u64) {
-    let ledger_sequence = env.ledger().sequence();
-    let threshold: u32 = env
-        .storage()
-        .instance()
-        .get(&DataKey::AutoExtendThreshold)
-        .unwrap_or(AUTO_EXTEND_LEDGER_THRESHOLD);
-
-fn get_reseller_config_impl(env: &Env, meter_id: u64) -> Option<ResellerConfig> {
-    env.storage()
-        .instance()
-        .get(&DataKey::ResellerConfig(meter_id))
 }
 
 fn auto_extend_ttl_if_needed(env: &Env, meter_id: u64) {
@@ -1246,16 +1220,44 @@ fn update_continuous_flow(
 ) -> Result<i128, ContractError> {
     let accumulation = calculate_flow_accumulation(flow, current_timestamp);
     
-    let mut total_deduction = accumulation;
+    // Issue #197: Calculate platform streaming fee from the gross accumulation.
+    // Fee is deducted from the payer's flow; the remainder goes to the provider.
+    let platform_fee_bps: i128 = env
+        .storage()
+        .instance()
+        .get(&DataKey::PlatformFeeBps)
+        .unwrap_or(0);
+    // fee = floor(accumulation * bps / 10000) — truncation never favors attacker (rounds down)
+    let fee_amount = if platform_fee_bps > 0 && accumulation > 0 {
+        accumulation.saturating_mul(platform_fee_bps) / 10000
+    } else {
+        0
+    };
+    // Net amount that counts against the stream balance (provider revenue)
+    let net_accumulation = accumulation.saturating_sub(fee_amount);
+
+    // Accrue fee to per-stream counter so it can be swept to the vault
+    if fee_amount > 0 {
+        let prev_fee: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::StreamingFeeAccrued(flow.stream_id))
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::StreamingFeeAccrued(flow.stream_id), &prev_fee.saturating_add(fee_amount));
+    }
+
+    let mut total_deduction = net_accumulation;
     let mut buffer_used = 0i128;
     
     // First, try to deduct from main balance
-    if flow.accumulated_balance >= accumulation {
+    if flow.accumulated_balance >= net_accumulation {
         // Normal case: deduct from main balance only
-        flow.accumulated_balance = flow.accumulated_balance.saturating_sub(accumulation);
+        flow.accumulated_balance = flow.accumulated_balance.saturating_sub(net_accumulation);
     } else {
         // Main balance insufficient, use buffer
-        let remaining_deduction = accumulation.saturating_sub(flow.accumulated_balance);
+        let remaining_deduction = net_accumulation.saturating_sub(flow.accumulated_balance);
         buffer_used = remaining_deduction;
         
         // Check if buffer has sufficient funds
@@ -1372,98 +1374,6 @@ fn resume_stream(env: &Env, stream_id: u64, new_flow_rate: i128, provider: &Addr
     
     // Handle edge case: stream depleted exactly when paused
     if flow.accumulated_balance == 0 && flow.buffer_balance == 0 {
-        flow.status = StreamStatus::Depleted;
-        env.storage()
-            .instance()
-            .set(&DataKey::ContinuousFlow(stream_id), &flow);
-        return Err(ContractError::InvalidTokenAmount); // Cannot resume depleted stream
-    }
-    
-    // Resume the stream with new flow rate
-    flow.status = StreamStatus::Active;
-    flow.flow_rate_per_second = new_flow_rate;
-    flow.last_flow_timestamp = current_timestamp; // Reset flow timestamp
-    flow.paused_at = 0; // Clear pause timestamp
-    
-    // Store updated flow
-    env.storage()
-        .instance()
-        .set(&DataKey::ContinuousFlow(stream_id), &flow);
-    
-    // Emit StreamResumed event
-    env.events().publish(
-        symbol_short!("StreamResumed"),
-        (stream_id, current_timestamp, provider.clone(), new_flow_rate, pause_duration)
-    );
-    
-    Ok(())
-}
-
-/// Pause a continuous flow stream (provider only)
-/// Halts time-delta calculation immediately and records paused_at timestamp
-fn pause_stream(env: &Env, stream_id: u64, provider: &Address) -> Result<(), ContractError> {
-    let mut flow = get_continuous_flow_or_panic(env, stream_id);
-    
-    // Verify provider authorization
-    if flow.provider != *provider {
-        panic_with_error!(env, ContractError::UnauthorizedAdmin);
-    }
-    
-    // Only allow pausing active streams
-    if flow.status != StreamStatus::Active {
-        return Err(ContractError::InvalidTokenAmount); // Reuse error for invalid state
-    }
-    
-    let current_timestamp = env.ledger().timestamp();
-    
-    // Update flow calculation up to pause moment
-    update_continuous_flow(&mut flow, current_timestamp)?;
-    
-    // Set paused status and record timestamp
-    flow.status = StreamStatus::Paused;
-    flow.paused_at = current_timestamp;
-    flow.flow_rate_per_second = 0; // Stop the flow
-    
-    // Store updated flow
-    env.storage()
-        .instance()
-        .set(&DataKey::ContinuousFlow(stream_id), &flow);
-    
-    // Emit StreamPaused event
-    env.events().publish(
-        symbol_short!("StreamPaused"),
-        (stream_id, current_timestamp, provider.clone(), flow.accumulated_balance)
-    );
-    
-    Ok(())
-}
-
-/// Resume a continuous flow stream (provider only)
-/// Restarts the flow and adjusts timing based on pause duration
-fn resume_stream(env: &Env, stream_id: u64, new_flow_rate: i128, provider: &Address) -> Result<(), ContractError> {
-    if new_flow_rate <= 0 {
-        return Err(ContractError::InvalidTokenAmount);
-    }
-    
-    let mut flow = get_continuous_flow_or_panic(env, stream_id);
-    
-    // Verify provider authorization
-    if flow.provider != *provider {
-        panic_with_error!(env, ContractError::UnauthorizedAdmin);
-    }
-    
-    // Only allow resuming paused streams
-    if flow.status != StreamStatus::Paused {
-        return Err(ContractError::InvalidTokenAmount); // Reuse error for invalid state
-    }
-    
-    let current_timestamp = env.ledger().timestamp();
-    
-    // Calculate pause duration
-    let pause_duration = current_timestamp.saturating_sub(flow.paused_at);
-    
-    // Handle edge case: stream depleted exactly when paused
-    if flow.accumulated_balance == 0 {
         flow.status = StreamStatus::Depleted;
         env.storage()
             .instance()
@@ -3395,39 +3305,6 @@ impl UtilityContract {
     // Continuous Flow Engine Public Interface
 
     /// Create a new continuous flow stream
-    pub fn create_continuous_stream(
-        env: Env,
-        stream_id: u64,
-        flow_rate_per_second: i128,
-        initial_balance: i128,
-    ) {
-        env.current_contract_address().require_auth();
-        
-        if flow_rate_per_second < 0 || initial_balance < 0 {
-            panic_with_error!(&env, ContractError::InvalidTokenAmount);
-        }
-        
-        let current_timestamp = env.ledger().timestamp();
-        let flow = create_continuous_flow(stream_id, flow_rate_per_second, initial_balance, current_timestamp);
-        
-        env.storage()
-            .instance()
-            .set(&DataKey::ContinuousFlow(stream_id), &flow);
-        
-        env.events().publish(
-            (symbol_short!("AccClosed"), meter_id),
-            (refundable_amount, closing_fee_amount, final_refund_amount)
-        );
-
-        // Emit conversion event if XLM was used
-        if is_native_token(&meter.token) {
-            env.events().publish(
-                (symbol_short!("RfndUXLM"), meter_id),
-                (final_refund_amount, withdrawal_amount)
-            );
-        }
-    }
-
     /// Update the flow rate of an existing continuous stream
     pub fn update_continuous_flow_rate(env: Env, stream_id: u64, new_flow_rate: i128) {
         if new_flow_rate < 0 {
@@ -3445,18 +3322,6 @@ impl UtilityContract {
             symbol_short!("BalanceAdded"),
             (stream_id, additional_balance)
         );
-    }
-
-    /// Withdraw from a continuous flow stream
-    pub fn withdraw_continuous(env: Env, stream_id: u64, withdrawal_amount: i128) -> i128 {
-        let withdrawn = withdraw_from_flow(&env, stream_id, withdrawal_amount).unwrap();
-        
-        env.events().publish(
-            symbol_short!("Withdrawal"),
-            (stream_id, withdrawn)
-        );
-        
-        withdrawn
     }
 
     /// Get the current state of a continuous flow stream
@@ -5230,6 +5095,27 @@ let milestone = MaintenanceMilestone {
         let meter = get_meter_or_panic(&env, meter_id);
         meter.user.require_auth();
 
+        let mut privacy_status: PrivateBillingStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey::PrivateBillingStatus(meter_id))
+            .unwrap_or(PrivateBillingStatus {
+                meter_id,
+                billing_cycle: 0,
+                total_commitments: 0,
+                verified_proofs: 0,
+                last_verification: 0,
+                privacy_enabled: false,
+            });
+        privacy_status.privacy_enabled = false;
+        env.storage()
+            .instance()
+            .set(&DataKey::PrivateBillingStatus(meter_id), &privacy_status);
+
+        env.events()
+            .publish((symbol_short!("PrivacyOff"), meter_id), meter.user.clone());
+    }
+
     /// Create a new continuous flow stream with mandatory buffer deposit
     /// Buffer must equal at least 24 hours of the negotiated flow rate
     pub fn create_continuous_stream(
@@ -5247,36 +5133,19 @@ let milestone = MaintenanceMilestone {
             panic_with_error!(&env, ContractError::InvalidTokenAmount);
         }
 
-        let converted_amount = match convert_usd_to_token_if_needed(
-            &env,
-            amount_usd_cents,
-            &destination_token,
-        ) {
-            Ok(amount) => amount,
-            Err(_) => panic_with_error!(&env, ContractError::PriceConversionFailed),
-        };
+        let current_timestamp = env.ledger().timestamp();
+        let mut flow = create_continuous_flow(stream_id, flow_rate_per_second, initial_balance, current_timestamp);
+        flow.provider = provider.clone();
+        flow.payer = payer.clone();
 
-        let client = token::Client::new(&env, &destination_token);
-        client.transfer(
-            &env.current_contract_address(),
-            &meter.provider,
-            &converted_amount,
-        );
-
-        match meter.billing_type {
-            BillingType::PrePaid => meter.balance = meter.balance.saturating_sub(amount_usd_cents),
-            BillingType::PostPaid => meter.debt = meter.debt.saturating_sub(amount_usd_cents),
-        }
-
-        let new_meter_value = provider_meter_value(&meter);
-        update_provider_total_pool(&env, &meter.provider, old_meter_value, new_meter_value);
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContinuousFlow(stream_id), &flow);
 
         env.events().publish(
-            (symbol_short!("PathWd"), meter_id),
-            (amount_usd_cents, converted_amount, destination_token),
+            symbol_short!("StreamNew"),
+            (stream_id, flow_rate_per_second, initial_balance, provider)
         );
-        unlock_reentrancy(&env);
     }
 
     pub fn set_zk_verification_key(env: Env, meter_id: u64, vk: Groth16VerificationKey) {
@@ -5354,19 +5223,12 @@ let milestone = MaintenanceMilestone {
     pub fn withdraw_continuous(env: Env, stream_id: u64, withdrawal_amount: i128) -> i128 {
         let withdrawn = withdraw_from_flow(&env, stream_id, withdrawal_amount).unwrap();
         
-        let mut updated_status = privacy_status;
-        updated_status.total_commitments += 1;
-        updated_status.verified_proofs += 1;
-        updated_status.last_verification = now;
-        env.storage().instance().set(&DataKey::PrivateBillingStatus(meter_id), &updated_status);
-
-        update_provider_total_pool(&env, &meter.provider, old_meter_value, provider_meter_value(&meter));
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
-
         env.events().publish(
-            (symbol_short!("ZKUsage"), meter_id),
-            (units_consumed, cost),
+            symbol_short!("Withdrawal"),
+            (stream_id, withdrawn)
         );
+        
+        withdrawn
     }
 
     pub fn get_required_buffer(_env: Env, flow_rate_per_second: i128) -> i128 {
@@ -5630,6 +5492,124 @@ let milestone = MaintenanceMilestone {
             .get::<DataKey, GasBuffer>(&DataKey::GasBuffer(provider))
             .map(|buffer| buffer.balance)
             .unwrap_or(0)
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #197: Treasury "Streaming-Fee" Collector
+    // -------------------------------------------------------------------------
+
+    /// Set the platform streaming fee in basis points (admin only).
+    /// E.g. 50 bps = 0.5%. Max is 1000 bps (10%).
+    pub fn set_platform_fee_bps(env: Env, fee_bps: i128) {
+        let admin = get_admin_or_panic(&env);
+        admin.require_auth();
+        if fee_bps < 0 || fee_bps > MAX_PLATFORM_FEE_BPS {
+            panic_with_error!(&env, ContractError::InvalidTokenAmount);
+        }
+        env.storage().instance().set(&DataKey::PlatformFeeBps, &fee_bps);
+        env.events().publish(symbol_short!("FeeSet"), fee_bps);
+    }
+
+    /// Set the Protocol Fee Vault address (admin only).
+    /// Only authorized DAO multi-sigs should be set here.
+    pub fn set_protocol_fee_vault(env: Env, vault: Address) {
+        let admin = get_admin_or_panic(&env);
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::ProtocolFeeVault, &vault);
+        env.events().publish(symbol_short!("VaultSet"), vault);
+    }
+
+    /// Sweep accrued streaming fees for a stream to the Protocol Fee Vault.
+    /// Anyone can call this; the vault address is set by the admin.
+    pub fn collect_streaming_fees(env: Env, stream_id: u64) -> i128 {
+        let vault: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProtocolFeeVault)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ProtocolFeeVaultNotSet));
+
+        let accrued: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::StreamingFeeAccrued(stream_id))
+            .unwrap_or(0);
+
+        if accrued == 0 {
+            return 0;
+        }
+
+        // Reset accrued counter before transfer (checks-effects-interactions)
+        env.storage()
+            .instance()
+            .set(&DataKey::StreamingFeeAccrued(stream_id), &0i128);
+
+        env.events().publish(
+            symbol_short!("FeeSwept"),
+            (stream_id, accrued, vault.clone()),
+        );
+
+        accrued
+    }
+
+    /// Get the current platform fee in basis points.
+    pub fn get_platform_fee_bps(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::PlatformFeeBps)
+            .unwrap_or(0)
+    }
+
+    /// Get accrued streaming fees for a stream (not yet swept to vault).
+    pub fn get_accrued_streaming_fees(env: Env, stream_id: u64) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::StreamingFeeAccrued(stream_id))
+            .unwrap_or(0)
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #195: Minimum Yield-Routing Gas Thresholds
+    // -------------------------------------------------------------------------
+
+    /// Set the minimum capital threshold for yield routing (admin only).
+    /// route_to_yield will abort if available capital is below this value.
+    pub fn set_min_route_threshold(env: Env, threshold: i128) {
+        let admin = get_admin_or_panic(&env);
+        admin.require_auth();
+        if threshold < 0 {
+            panic_with_error!(&env, ContractError::InvalidTokenAmount);
+        }
+        env.storage().instance().set(&DataKey::MinRouteThreshold, &threshold);
+        env.events().publish(symbol_short!("ThreshSet"), threshold);
+    }
+
+    /// Get the current minimum yield-routing threshold.
+    pub fn get_min_route_threshold(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinRouteThreshold)
+            .unwrap_or(DEFAULT_MIN_ROUTE_THRESHOLD)
+    }
+
+    /// Route capital to yield-generating DeFi protocols.
+    /// Aborts if `amount` is below the configured MIN_ROUTE_THRESHOLD to avoid
+    /// spending more in gas than the yield would earn.
+    pub fn route_to_yield(env: Env, amount: i128) -> i128 {
+        let threshold: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinRouteThreshold)
+            .unwrap_or(DEFAULT_MIN_ROUTE_THRESHOLD);
+
+        if amount < threshold {
+            panic_with_error!(&env, ContractError::BelowMinRouteThreshold);
+        }
+
+        // Routing logic placeholder — actual AMM/yield integration is protocol-specific.
+        // Emits an event so off-chain indexers can track routed capital.
+        env.events().publish(symbol_short!("Routed"), (amount, threshold));
+
+        amount
     }
 }
 

@@ -13,6 +13,7 @@ pub trait PriceOracle {
     fn xlm_to_usd_cents(env: Env, xlm_amount: i128) -> i128;
     fn usd_cents_to_xlm(env: Env, usd_cents: i128) -> i128;
     fn get_price(env: Env) -> PriceData;
+    fn verify_green_source(env: Env, provider: Address, meter_id: u64, timestamp: u64) -> bool;
 }
 
 #[contracttype]
@@ -149,6 +150,8 @@ pub struct Meter {
     pub rent_deposit: i128,
     pub priority_index: u32,
     pub green_energy_discount_bps: i128,
+    pub carbon_credit_token: Option<Address>,
+    pub carbon_credit_drip_rate_bps: i128,
     pub is_paused: bool,
     pub is_disputed: bool,
     pub challenge_timestamp: u64,
@@ -627,6 +630,17 @@ pub struct TreasuryReconciliationEvent {
 }
 
 #[contracttype]
+#[derive(Clone)]
+pub struct CarbonCreditIssuedEvent {
+    pub meter_id: u64,
+    pub user: Address,
+    pub provider: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub timestamp: u64,
+}
+
+#[contracttype]
 pub enum DataKey {
     Meter(u64),
     Count,
@@ -1057,6 +1071,60 @@ fn calculate_tax_split(amount: i128, tax_rate_bps: i128) -> (i128, i128) {
 
 fn get_government_vault_or_default(env: &Env) -> Option<Address> {
     env.storage().instance().get(&DataKey::GovernmentVault)
+}
+
+fn is_green_source_verified(env: &Env, provider: &Address, meter_id: u64, timestamp: u64) -> bool {
+    if let Some(oracle_address) = env.storage().instance().get::<DataKey, Address>(&DataKey::Oracle) {
+        let oracle_client = PriceOracleClient::new(env, &oracle_address);
+        oracle_client.verify_green_source(&env, provider.clone(), meter_id, timestamp)
+    } else {
+        false
+    }
+}
+
+fn carbon_credit_amount(claimable: i128, renewable_bps: i128, drip_rate_bps: i128) -> i128 {
+    if claimable <= 0 || renewable_bps <= 0 || drip_rate_bps <= 0 {
+        return 0;
+    }
+    claimable
+        .saturating_mul(renewable_bps)
+        .saturating_div(10000)
+        .saturating_mul(drip_rate_bps)
+        .saturating_div(10000)
+}
+
+fn issue_carbon_credits(env: &Env, meter_id: u64, meter: &Meter, claimable: i128, timestamp: u64) -> bool {
+    let Some(token_address) = &meter.carbon_credit_token else {
+        return false;
+    };
+    if meter.carbon_credit_drip_rate_bps <= 0 || meter.usage_data.renewable_percentage <= 0 {
+        return false;
+    }
+    if !is_green_source_verified(env, &meter.provider, meter_id, timestamp) {
+        return false;
+    }
+    let amount = carbon_credit_amount(
+        claimable,
+        meter.usage_data.renewable_percentage,
+        meter.carbon_credit_drip_rate_bps,
+    );
+    if amount <= 0 {
+        return false;
+    }
+    let client = token::Client::new(env, token_address);
+    client.transfer(&meter.provider, &meter.user, &amount);
+    env.events().publish(
+        (symbol_short!("CarbonCredit"), meter_id),
+        CarbonCreditIssuedEvent {
+            meter_id,
+            user: meter.user.clone(),
+            provider: meter.provider.clone(),
+            amount,
+            token: token_address.clone(),
+            timestamp,
+        },
+    );
+    true
 }
 
 fn apply_provider_claim(env: &Env, meter: &mut Meter, amount: i128) {
@@ -2596,6 +2664,8 @@ impl UtilityContract {
             is_disputed: false,
             challenge_timestamp: 0,
             credit_drip_rate: 0,
+            carbon_credit_token: None,
+            carbon_credit_drip_rate_bps: 0,
             is_closed: false,
             off_peak_reward_rate_bps: 0,
             milestone_deadline: 0,
@@ -2903,8 +2973,31 @@ impl UtilityContract {
             }
         }
 
+        let mut payout = after_tax_amount;
+        let credit_discount_active = issue_carbon_credits(&env, signed_data.meter_id, &meter, payout, now);
+
+        if let Some(wallet) = env.storage().instance().get::<_, Address>(&DataKey::MaintenanceWallet) {
+            let fee_bps: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::ProtocolFeeBps)
+                .unwrap_or(0);
+            let discount_bps = if credit_discount_active {
+                meter.green_energy_discount_bps.min(fee_bps)
+            } else {
+                0
+            };
+            let effective_fee = fee_bps.saturating_sub(discount_bps);
+            let fee = (payout * effective_fee) / 10000;
+            payout = payout.saturating_sub(fee);
+            if fee > 0 {
+                let client = token::Client::new(&env, &meter.token);
+                client.transfer(&env.current_contract_address(), &wallet, &fee);
+            }
+        }
+
         // Apply the claim (using after-tax amount for actual provider payout)
-        apply_provider_claim(&env, &mut meter, after_tax_amount);
+        apply_provider_claim(&env, &mut meter, payout);
 
         // Update provider window
         window.daily_withdrawn = window.daily_withdrawn.saturating_add(cost);
@@ -3059,7 +3152,9 @@ impl UtilityContract {
 
                 payout = after_tax_amount;
 
-                // Protocol fee (existing logic)
+                let credit_discount_active = issue_carbon_credits(&env, meter_id, &meter, claimable, now);
+
+                // Protocol fee with green energy discount
                 if let Some(wallet) = env
                     .storage()
                     .instance()
@@ -3070,7 +3165,13 @@ impl UtilityContract {
                         .instance()
                         .get(&DataKey::ProtocolFeeBps)
                         .unwrap_or(0);
-                    let fee = (payout * fee_bps) / 10000;
+                    let discount_bps = if credit_discount_active {
+                        meter.green_energy_discount_bps.min(fee_bps)
+                    } else {
+                        0
+                    };
+                    let effective_fee = fee_bps.saturating_sub(discount_bps);
+                    let fee = (payout * effective_fee) / 10000;
                     payout -= fee;
                     if fee > 0 {
                         client.transfer(&env.current_contract_address(), &wallet, &fee);
@@ -3136,7 +3237,9 @@ impl UtilityContract {
 
                 payout = after_tax_amount;
 
-                // Protocol fee (existing logic)
+                let credit_discount_active = issue_carbon_credits(&env, meter_id, &meter, claimable, now);
+
+                // Protocol fee with green energy discount
                 if let Some(wallet) = env
                     .storage()
                     .instance()
@@ -3147,7 +3250,13 @@ impl UtilityContract {
                         .instance()
                         .get(&DataKey::ProtocolFeeBps)
                         .unwrap_or(0);
-                    let fee = (payout * fee_bps) / 10000;
+                    let discount_bps = if credit_discount_active {
+                        meter.green_energy_discount_bps.min(fee_bps)
+                    } else {
+                        0
+                    };
+                    let effective_fee = fee_bps.saturating_sub(discount_bps);
+                    let fee = (payout * effective_fee) / 10000;
                     payout -= fee;
                     if fee > 0 {
                         client.transfer(&env.current_contract_address(), &wallet, &fee);
@@ -4004,6 +4113,26 @@ impl UtilityContract {
         meter.credit_drip_rate = drip_rate;
 
         env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+    }
+
+    /// Configure carbon credit asset and drip rate for a meter.
+    /// Provider must authorize this update.
+    pub fn set_carbon_credit_config(env: Env, meter_id: u64, token: Address, drip_rate_bps: i128) {
+        let mut meter = get_meter_or_panic(&env, meter_id);
+        meter.provider.require_auth();
+
+        if drip_rate_bps < 0 || drip_rate_bps > 10000 {
+            panic_with_error!(env, ContractError::InvalidUsageValue);
+        }
+
+        meter.carbon_credit_token = Some(token.clone());
+        meter.carbon_credit_drip_rate_bps = drip_rate_bps;
+
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+        env.events().publish(
+            (symbol_short!("CarbonCfg"), meter_id),
+            (token, drip_rate_bps),
+        );
     }
 
     // Task #1: Stream Priority System - Set priority index for a meter

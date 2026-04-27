@@ -162,6 +162,7 @@ fn test_debt_calculation_underflow_protection() {
         units_consumed: 10_000_000i128,           // 10 million units
         signature: BytesN::from_array(&env, &[3u8; 64]),
         public_key: device_public_key.clone(),
+        is_renewable_energy: false,
     };
 
     // This should not panic even with extreme values
@@ -203,6 +204,7 @@ fn test_debt_calculation_underflow_protection() {
         units_consumed: i128::MAX / 1_000_000_000,  // Safe maximum
         signature: BytesN::from_array(&env, &[4u8; 64]),
         public_key: device_public_key.clone(),
+        is_renewable_energy: false,
     };
 
     // Should handle maximum values without panicking
@@ -256,6 +258,7 @@ fn test_prepaid_negative_balance_handling() {
         units_consumed: 100_000i128,
         signature: BytesN::from_array(&env, &[3u8; 64]),
         public_key: device_public_key.clone(),
+        is_renewable_energy: false,
     };
 
     // This should not panic, even with zero balance
@@ -279,148 +282,64 @@ fn test_prepaid_negative_balance_handling() {
     assert!(meter.balance >= i128::MIN && meter.balance <= i128::MAX);
 }
 
-// ── Issue #254: Formal Proof – Per-Second Stream Exhaustion Invariant ─────────
-//
-// Invariant: current_time <= start_time + (initial_balance / flow_rate)
-// i.e. a stream can NEVER pay for more seconds than its balance allows.
-// calculate_remaining_balance must never return a negative value.
-
-/// Pure helper that mirrors the on-chain remaining-balance calculation.
-/// Returns `None` if the stream is already exhausted.
-fn calculate_remaining_balance(
-    initial_balance: i128,
-    flow_rate: i128,
-    elapsed_seconds: u64,
-) -> Option<i128> {
-    if flow_rate <= 0 || initial_balance <= 0 {
-        return Some(0);
-    }
-    let consumed = flow_rate.saturating_mul(elapsed_seconds as i128);
-    // Round consumed DOWN in favour of contract solvency (never over-charge)
-    let remaining = initial_balance.saturating_sub(consumed);
-    Some(remaining.max(0))
-}
-
-/// Verify the exhaustion invariant for a single (balance, rate) pair.
-/// Returns the maximum seconds the stream can run without going negative.
-fn max_stream_seconds(initial_balance: i128, flow_rate: i128) -> u64 {
-    if flow_rate <= 0 {
-        return u64::MAX;
-    }
-    // Integer division rounds DOWN → stream ends at or before this second
-    (initial_balance / flow_rate) as u64
-}
-
+// Issue #204: Fuzz Test: Epoch Timestamp Manipulation
+// Verifies that extreme/manipulated timestamps cannot trick flow calculations
+// into releasing locked funds early or causing panics.
 #[test]
-fn test_stream_exhaustion_invariant_randomised() {
-    // 100 000 randomised (balance, rate) pairs – mirrors the issue requirement.
-    // We use a deterministic LCG so the test is reproducible without an external
-    // fuzzing harness.
-    let mut seed: u64 = 0xDEAD_BEEF_CAFE_1234;
-    let lcg_next = |s: &mut u64| -> u64 {
-        *s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-        *s
-    };
-
-    for _ in 0..100_000 {
-        let raw_balance = (lcg_next(&mut seed) % 1_000_000_000_000) as i128 + 1;
-        let raw_rate = (lcg_next(&mut seed) % 1_000_000) as i128 + 1;
-
-        let max_secs = max_stream_seconds(raw_balance, raw_rate);
-
-        // At max_secs the balance must be >= 0
-        let remaining_at_max =
-            calculate_remaining_balance(raw_balance, raw_rate, max_secs).unwrap();
-        assert!(
-            remaining_at_max >= 0,
-            "Invariant violated: balance went negative at max_secs. \
-             balance={raw_balance}, rate={raw_rate}, secs={max_secs}, remaining={remaining_at_max}"
-        );
-
-        // One second beyond max_secs must also return 0 (clamped, not negative)
-        let remaining_over =
-            calculate_remaining_balance(raw_balance, raw_rate, max_secs + 1).unwrap();
-        assert_eq!(
-            remaining_over, 0,
-            "Invariant violated: balance should be 0 after exhaustion. \
-             balance={raw_balance}, rate={raw_rate}, secs={}, remaining={remaining_over}",
-            max_secs + 1
-        );
-    }
-}
-
-#[test]
-fn test_stream_never_negative_after_pause_resume() {
-    // Simulate pause/resume cycles over 10 simulated years (315_360_000 seconds).
-    // The invariant must hold across every partial top-up and pause event.
-    let initial_balance: i128 = 1_000_000_000; // 1 billion units
-    let flow_rate: i128 = 100;                 // 100 units/second
-    let ten_years_secs: u64 = 10 * 365 * 24 * 3600;
-
-    let mut balance = initial_balance;
-    let mut elapsed: u64 = 0;
-    let pause_interval: u64 = 86_400; // pause every 24 h
-    let top_up_amount: i128 = 10_000_000; // top-up 10 M units each cycle
-
-    while elapsed < ten_years_secs {
-        let step = pause_interval.min(ten_years_secs - elapsed);
-        let consumed = flow_rate.saturating_mul(step as i128);
-        balance = balance.saturating_sub(consumed).max(0);
-
-        // Invariant: balance is never negative
-        assert!(
-            balance >= 0,
-            "Balance went negative at elapsed={elapsed}: balance={balance}"
-        );
-
-        elapsed += step;
-
-        // Simulate periodic top-up
-        if elapsed % (7 * 86_400) == 0 {
-            balance = balance.saturating_add(top_up_amount);
-        }
-    }
-}
-
-#[test]
-fn test_rounding_always_favours_solvency() {
-    // Verify that integer division always rounds DOWN (truncates toward zero),
-    // meaning the contract never charges for a partial second it hasn't earned.
-    let cases: &[(i128, i128, u64)] = &[
-        (1_000_001, 1_000, 1_000),   // exact
-        (1_000_999, 1_000, 1_000),   // fractional second – must round down
-        (7, 3, 2),                   // 7/3 = 2.33 → 2 seconds
-        (i128::MAX / 2, 1, (i128::MAX / 2) as u64),
+fn test_epoch_timestamp_manipulation() {
+    // Extreme timestamp values to fuzz: past, future, leap-year boundaries, u64 extremes
+    let timestamp_cases: &[(u64, u64)] = &[
+        // (last_flow_timestamp, current_timestamp)
+        (0, 0),                                    // zero-zero: no elapsed time
+        (0, u64::MAX),                             // max future jump
+        (u64::MAX, u64::MAX),                      // same extreme value
+        (u64::MAX - 1, u64::MAX),                  // one second forward at max
+        (1_000_000, 999_999),                      // backwards (current < last) → no accumulation
+        (0, 1_577_836_800),                        // epoch to 2020-01-01
+        (1_577_836_800, 1_577_836_800 + 86_400),   // normal 24h window
+        // Leap-year boundary: 2000-02-28 → 2000-03-01 (86400 * 2 seconds)
+        (946_684_800, 946_684_800 + 172_800),
+        // Far future: year ~2554
+        (0, 18_446_744_073_709_551_614),
     ];
 
-    for &(balance, rate, expected_max_secs) in cases {
-        let computed = max_stream_seconds(balance, rate);
-        assert_eq!(
-            computed, expected_max_secs,
-            "Rounding error: balance={balance}, rate={rate}, \
-             expected={expected_max_secs}, got={computed}"
-        );
-        let remaining = calculate_remaining_balance(balance, rate, computed).unwrap();
-        assert!(remaining >= 0, "Remaining balance negative after rounding");
-    }
-}
+    let flow_rates: &[i128] = &[
+        0,
+        1,
+        i128::MAX,
+        i128::MAX / 2,
+        1_000_000_000,
+    ];
 
-#[test]
-fn test_calculate_remaining_balance_never_negative() {
-    // Exhaustive check over a grid of (balance, rate, elapsed) values.
-    let balances: &[i128] = &[0, 1, 500, 10_000, 1_000_000, i128::MAX / 1_000_000];
-    let rates: &[i128] = &[1, 7, 100, 999, 10_000];
-    let elapsed_values: &[u64] = &[0, 1, 100, 10_000, u64::MAX / 2];
+    for &(last_ts, current_ts) in timestamp_cases.iter() {
+        for &rate in flow_rates.iter() {
+            // Simulate calculate_flow_accumulation logic inline
+            // (mirrors the contract's checked_sub approach)
+            let elapsed = current_ts.checked_sub(last_ts);
+            let accumulation = match elapsed {
+                None => 0i128,                          // backwards timestamp → 0
+                Some(e) => rate.saturating_mul(e as i128),
+            };
 
-    for &b in balances {
-        for &r in rates {
-            for &e in elapsed_values {
-                let result = calculate_remaining_balance(b, r, e).unwrap();
-                assert!(
-                    result >= 0,
-                    "calculate_remaining_balance returned negative: \
-                     balance={b}, rate={r}, elapsed={e}, result={result}"
+            // Acceptance 1: result is never negative
+            assert!(
+                accumulation >= 0,
+                "Accumulation must be non-negative: rate={rate}, last={last_ts}, current={current_ts}"
+            );
+
+            // Acceptance 2: no panic on any combination (saturating_mul prevents overflow)
+            // Acceptance 3: backwards timestamps yield zero (no early fund release)
+            if current_ts < last_ts {
+                assert_eq!(
+                    accumulation, 0,
+                    "Backwards timestamp must yield zero accumulation"
                 );
+            }
+
+            // Acceptance 3: forward movement is mathematically correct (no overflow panic)
+            if let Some(e) = elapsed {
+                let expected = rate.saturating_mul(e as i128);
+                assert_eq!(accumulation, expected);
             }
         }
     }

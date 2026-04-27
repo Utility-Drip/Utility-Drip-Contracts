@@ -53,6 +53,48 @@ class MeterDevice {
   }
 
   /**
+   * Generate ZK-SNARK usage data with mock Groth16 proof
+   */
+  generateZkUsageData(mode = 'realistic') {
+    const now = Math.floor(Date.now() / 1000);
+    const isPeakHour = this._isPeakHour(now);
+    
+    let wattHours;
+    switch (mode) {
+      case 'surge': wattHours = this._generateSurgeUsage(isPeakHour); break;
+      case 'low': wattHours = this._generateLowUsage(isPeakHour); break;
+      default: wattHours = this._generateRealisticUsage(isPeakHour); break;
+    }
+    
+    const effectiveRate = isPeakHour ? this.offPeakRate * 1.5 : this.offPeakRate;
+    const units = Math.ceil((wattHours * effectiveRate) / (3600 * 1000));
+    
+    // Update device state
+    this.totalWattHours += wattHours;
+    this.currentCycleWattHours += wattHours;
+    this.lastReadingTimestamp = now;
+
+    // Generate mock Groth16 proof and public inputs
+    const proof = this._createMockGroth16Proof(units, isPeakHour);
+    
+    // Create nullifier (hash of meterId and timestamp to prevent replay)
+    const nullifier = crypto.createHash('sha256')
+      .update(`${this.meterId}-${now}`)
+      .digest();
+
+    return {
+      meter_id: this.meterId,
+      timestamp: now,
+      units_consumed: units,
+      proof: proof,
+      public_inputs: this._createZkPublicInputs(units, isPeakHour, nullifier),
+      nullifier: nullifier.toString('hex'),
+      is_peak_hour: isPeakHour,
+      display_watt_hours: wattHours
+    };
+  }
+
+  /**
    * Generate custom usage data with specific values
    */
   generateCustomUsageData(wattHours, units) {
@@ -182,6 +224,41 @@ class MeterDevice {
     buffer.writeBigInt64LE(BigInt(units), 24);
     
     return buffer;
+  }
+
+  /**
+   * Create mock Groth16 proof structure
+   */
+  _createMockGroth16Proof(units, isPeakHour) {
+    // In a real device, this would call a WASM/Native Groth16 prover
+    // For simulation, we return a structure matching the contract's expected format
+    return {
+      a: Buffer.alloc(64, 1).toString('base64'), // Mock G1
+      b: Buffer.alloc(128, 2).toString('base64'), // Mock G2
+      c: Buffer.alloc(64, 3).toString('base64') // Mock G1
+    };
+  }
+
+  /**
+   * Create ZK public inputs serialized as bytes
+   */
+  _createZkPublicInputs(units, isPeakHour, nullifier) {
+    const inputs = [];
+    
+    // Input 0: units_consumed (16 bytes BE)
+    const unitsBuf = Buffer.alloc(16);
+    unitsBuf.writeBigInt64BE(BigInt(units), 8); // Write to the lower 8 bytes
+    inputs.push(unitsBuf.toString('base64'));
+    
+    // Input 1: is_peak_hour (1 byte as field element)
+    const peakBuf = Buffer.alloc(32, 0);
+    peakBuf[31] = isPeakHour ? 1 : 0;
+    inputs.push(peakBuf.toString('base64'));
+    
+    // Input 2: nullifier (32 bytes)
+    inputs.push(nullifier.toString('base64'));
+    
+    return inputs;
   }
 
   /**

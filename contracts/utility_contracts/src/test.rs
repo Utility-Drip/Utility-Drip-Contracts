@@ -44,6 +44,41 @@ mod mock_sorosusu {
     }
 }
 
+mod mock_environmental_oracle {
+    use soroban_sdk::{contract, contractimpl, Address, Env};
+
+    #[contract]
+    pub struct MockEnvironmentalOracle;
+
+    #[contractimpl]
+    impl MockEnvironmentalOracle {
+        pub fn xlm_to_usd_cents(_env: Env, xlm_amount: i128) -> i128 {
+            xlm_amount.saturating_mul(100)
+        }
+
+        pub fn usd_cents_to_xlm(_env: Env, usd_cents: i128) -> i128 {
+            usd_cents.saturating_div(100)
+        }
+
+        pub fn get_price(env: Env) -> utility_contracts::PriceData {
+            utility_contracts::PriceData {
+                price: 100,
+                decimals: 2,
+                last_updated: env.ledger().timestamp(),
+            }
+        }
+
+        pub fn verify_green_source(
+            _env: Env,
+            _provider: Address,
+            _meter_id: u64,
+            _timestamp: u64,
+        ) -> bool {
+            true
+        }
+    }
+}
+
 #[test]
 fn test_grace_period_expiration() {
     let env = Env::default();
@@ -176,6 +211,62 @@ fn test_green_energy_bonus() {
 
     let fund_after = client.get_maintenance_fund(&meter_id);
     assert!(fund_after < fund_before);
+}
+
+#[test]
+fn test_carbon_credit_stream_creates_credits_and_reduces_protocol_fee() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let payment_admin = Address::generate(&env);
+    let credit_admin = provider.clone();
+
+    let payment_token = env.register_stellar_asset_contract_v2(payment_admin.clone()).address();
+    let credit_token = env.register_stellar_asset_contract_v2(credit_admin.clone()).address();
+
+    let payment_client = token::StellarAssetClient::new(&env, &payment_token);
+    let credit_client = token::StellarAssetClient::new(&env, &credit_token);
+
+    payment_client.mint(&user, &100_000);
+    credit_client.mint(&provider, &100_000);
+
+    let oracle_id = env.register_contract(None, mock_environmental_oracle::MockEnvironmentalOracle);
+    client.set_oracle(&oracle_id);
+
+    let fee_wallet = Address::generate(&env);
+    client.set_maintenance_config(&fee_wallet, &1000);
+
+    let device_public_key = device_key(&env, 99);
+    let meter_id = client.register_meter(&user, &provider, &10, &payment_token, &device_public_key, &0, &0);
+    client.top_up(&meter_id, &50_000);
+    client.initiate_pairing(&meter_id);
+    client.complete_pairing(&meter_id, &BytesN::from_array(&env, &[2u8; 64]));
+
+    client.set_green_energy_discount(&meter_id, &2000);
+    client.set_carbon_credit_config(&meter_id, credit_token.clone(), &500);
+
+    let signed_usage = SignedUsageData {
+        meter_id,
+        timestamp: env.ledger().timestamp(),
+        watt_hours_consumed: 1000,
+        units_consumed: 10,
+        signature: BytesN::from_array(&env, &[3u8; 64]),
+        public_key: device_public_key,
+        is_renewable_energy: true,
+    };
+
+    client.deduct_units(&signed_usage);
+
+    let credit_balance = credit_client.balance(&user);
+    assert!(credit_balance > 0);
+
+    let fee_balance = payment_client.balance(&fee_wallet);
+    assert!(fee_balance < 1000);
 }
 
 // ==================== PROVIDER RELIABILITY TESTS ====================

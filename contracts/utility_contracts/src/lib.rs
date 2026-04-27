@@ -1766,6 +1766,18 @@ fn withdraw_from_flow(
 
 #[contractimpl]
 impl UtilityContract {
+    /// Assigns a reseller to a specific meter with a defined fee percentage.
+    ///
+    /// # Arguments
+    /// * `env` - The execution environment.
+    /// * `meter_id` - The unique identifier of the meter.
+    /// * `reseller` - The address of the reseller to assign.
+    /// * `fee_bps` - The reseller fee in basis points (1 bp = 0.01%).
+    ///
+    /// # Panics
+    /// * Panics if the caller is not the provider of the meter.
+    /// * Panics if the meter does not exist (`ContractError::MeterNotFound`).
+    /// * Panics if `fee_bps` exceeds `MAX_RESELLER_FEE_BPS` (`ContractError::InvalidResellerFee`).
     pub fn assign_reseller(env: Env, meter_id: u64, reseller: Address, fee_bps: i128) {
         let meter = get_meter_or_panic(&env, meter_id);
         meter.provider.require_auth();
@@ -1776,6 +1788,16 @@ impl UtilityContract {
         env.events().publish((symbol_short!("RslrSet"), meter_id), (reseller, fee_bps));
     }
 
+    /// Claims an Impact Soulbound Token (SBT) for a user based on renewable energy usage.
+    ///
+    /// # Arguments
+    /// * `env` - The execution environment.
+    /// * `meter_id` - The unique identifier of the meter.
+    ///
+    /// # Panics
+    /// * Panics if the caller is not the user of the meter.
+    /// * Panics if the SBT has already been minted for this meter (`ContractError::SBTAlreadyMinted`).
+    /// * Panics if the renewable energy usage is below the threshold (`ContractError::ImpactNotSignificantEnough`).
     pub fn claim_impact_sbt(env: Env, meter_id: u64) {
         let meter = get_meter_or_panic(&env, meter_id);
         meter.user.require_auth();
@@ -1789,10 +1811,20 @@ impl UtilityContract {
             panic_with_error!(&env, ContractError::ImpactNotSignificantEnough);
         }
     }
+
+    /// Retrieves the minimum balance required for a continuous flow to remain active.
+    ///
+    /// # Returns
+    /// * `i128` - The minimum balance required to flow.
     pub fn get_minimum_balance_to_flow() -> i128 {
         MINIMUM_BALANCE_TO_FLOW
     }
 
+    /// Sets the address of the trusted price oracle.
+    ///
+    /// # Arguments
+    /// * `env` - The execution environment.
+    /// * `oracle_address` - The address of the oracle contract.
     pub fn set_oracle(env: Env, oracle_address: Address) {
         // This should be called by admin to set the oracle address
         env.storage()
@@ -1800,6 +1832,12 @@ impl UtilityContract {
             .set(&DataKey::Oracle, &oracle_address);
     }
 
+    /// Sets the maintenance wallet address and the protocol fee basis points.
+    ///
+    /// # Arguments
+    /// * `env` - The execution environment.
+    /// * `wallet` - The address of the maintenance wallet to receive protocol fees.
+    /// * `fee_bps` - The protocol fee in basis points.
     pub fn set_maintenance_config(env: Env, wallet: Address, fee_bps: i128) {
         env.storage()
             .instance()
@@ -1809,7 +1847,14 @@ impl UtilityContract {
             .set(&DataKey::ProtocolFeeBps, &fee_bps);
     }
 
-    /// Set admin address for dust sweeper authorization
+    /// Sets the admin address for the contract, used for dust sweeper authorization.
+    ///
+    /// # Arguments
+    /// * `env` - The execution environment.
+    /// * `admin_address` - The address to be set as the new admin.
+    ///
+    /// # Panics
+    /// * Panics if the caller is not the current contract address (self-invocation).
     pub fn set_admin(env: Env, admin_address: Address) {
         env.current_contract_address().require_auth();
         env.storage()
@@ -1817,7 +1862,15 @@ impl UtilityContract {
             .set(&DataKey::AdminAddress, &admin_address);
     }
 
-    /// Add funds to gas bounty pool for dust sweepers
+    /// Adds funds to the gas bounty pool used to reward dust sweepers.
+    ///
+    /// # Arguments
+    /// * `env` - The execution environment.
+    /// * `amount` - The amount of tokens to add to the gas bounty pool.
+    ///
+    /// # Panics
+    /// * Panics if the caller is not the authorized admin (`ContractError::UnauthorizedAdmin`).
+    /// * Panics if `amount` is zero or negative (`ContractError::InvalidTokenAmount`).
     pub fn fund_gas_bounty(env: Env, amount: i128) {
         require_admin_auth(&env);
         
@@ -1840,12 +1893,22 @@ impl UtilityContract {
             .publish((symbol_short!("BntyFund"),), amount);
     }
 
+    /// Marks a given token address as supported by the system.
+    ///
+    /// # Arguments
+    /// * `env` - The execution environment.
+    /// * `token` - The token address to whitelist.
     pub fn add_supported_token(env: Env, token: Address) {
         env.storage()
             .instance()
             .set(&DataKey::SupportedToken(token), &true);
     }
 
+    /// Removes a previously supported token from the system's whitelist.
+    ///
+    /// # Arguments
+    /// * `env` - The execution environment.
+    /// * `token` - The token address to revoke.
     pub fn remove_supported_token(env: Env, token: Address) {
         env.storage()
             .instance()

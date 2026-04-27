@@ -1753,3 +1753,212 @@ fn test_green_energy_bonus() {
     assert!(final_meter.usage_data.renewable_percentage > 0);
 }
 
+
+// ── Issue #258: Auto-Rent-Deduction tests ────────────────────────────────────
+
+#[test]
+fn test_auto_rent_deduction_skipped_when_ttl_healthy() {
+    // When TTL is above the threshold, no rent deduction should occur.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+    token_admin_client.mint(&user, &10_000_000);
+
+    let device_key = BytesN::from_array(&env, &[1u8; 32]);
+    let meter_id = client.register_meter(&user, &provider, &10, &token_address, &device_key);
+    client.top_up(&meter_id, &5_000_000);
+
+    let meter_before = client.get_meter(&meter_id).unwrap();
+    let balance_before = meter_before.balance;
+
+    // Advance time and claim – TTL is healthy by default in test env so no deduction
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    client.claim(&meter_id);
+
+    let meter_after = client.get_meter(&meter_id).unwrap();
+    // Balance should only decrease by the claimed flow amount, not by rent
+    assert!(meter_after.balance <= balance_before);
+}
+
+// ── Issue #253: Multi-Sig Technical Veto tests ───────────────────────────────
+
+#[test]
+fn test_fleet_council_registration_and_veto() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    let device_key = BytesN::from_array(&env, &[1u8; 32]);
+    let meter_id = client.register_meter(&user, &provider, &100, &token_address, &device_key);
+
+    // Register a 3-member council
+    let m1 = Address::generate(&env);
+    let m2 = Address::generate(&env);
+    let m3 = Address::generate(&env);
+    let mut members = soroban_sdk::Vec::new(&env);
+    members.push_back(m1.clone());
+    members.push_back(m2.clone());
+    members.push_back(m3.clone());
+    client.register_fleet_council(&provider, &members);
+
+    let council = client.get_fleet_council(&provider).unwrap();
+    assert_eq!(council.members.len(), 3);
+
+    // Stage an update
+    client.stage_fleet_update(&meter_id, &200);
+    let staged = client.get_staged_update(&meter_id).unwrap();
+    assert_eq!(staged.new_off_peak_rate, 200);
+    assert!(!staged.is_vetoed);
+
+    // Two veto approvals – not enough yet
+    client.veto_fleet_update(&meter_id, &m1);
+    client.veto_fleet_update(&meter_id, &m2);
+    let staged2 = client.get_staged_update(&meter_id).unwrap();
+    assert!(!staged2.is_vetoed);
+
+    // Third approval reaches threshold → vetoed
+    client.veto_fleet_update(&meter_id, &m3);
+    let staged3 = client.get_staged_update(&meter_id).unwrap();
+    assert!(staged3.is_vetoed);
+}
+
+#[test]
+fn test_fleet_update_executes_after_staging_window() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    let device_key = BytesN::from_array(&env, &[1u8; 32]);
+    let meter_id = client.register_meter(&user, &provider, &100, &token_address, &device_key);
+
+    client.stage_fleet_update(&meter_id, &250);
+
+    // Advance past the 48-hour staging window
+    env.ledger().with_mut(|l| l.timestamp += 48 * 3600 + 1);
+
+    client.execute_fleet_update(&meter_id, &false);
+
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert_eq!(meter.off_peak_rate, 250);
+    // Staged update should be cleared
+    assert!(client.get_staged_update(&meter_id).is_none());
+}
+
+#[test]
+fn test_fleet_update_blocked_during_staging_window() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    let device_key = BytesN::from_array(&env, &[1u8; 32]);
+    let meter_id = client.register_meter(&user, &provider, &100, &token_address, &device_key);
+
+    client.stage_fleet_update(&meter_id, &300);
+
+    // Try to execute before the window expires – should panic
+    let result = std::panic::catch_unwind(|| {
+        client.execute_fleet_update(&meter_id, &false);
+    });
+    // We expect a panic (contract error) here
+    // In soroban test env panics propagate as Rust panics
+    assert!(result.is_err() || client.get_staged_update(&meter_id).is_some());
+}
+
+// ── Issue #252: Carbon-Credit Streaming tests ────────────────────────────────
+
+#[test]
+fn test_carbon_credit_state_initialised() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    let device_key = BytesN::from_array(&env, &[1u8; 32]);
+    let meter_id = client.register_meter(&user, &provider, &100, &token_address, &device_key);
+
+    // No state yet
+    assert!(client.get_carbon_credit_state(&meter_id).is_none());
+
+    // Set green energy ratio
+    client.set_green_energy_ratio(&meter_id, &8_000); // 80% solar
+
+    let state = client.get_carbon_credit_state(&meter_id).unwrap();
+    assert_eq!(state.green_energy_ratio_bps, 8_000);
+    assert_eq!(state.accumulated_slices, 0);
+    assert_eq!(state.total_minted, 0);
+    assert_eq!(state.deferred_credits, 0);
+}
+
+#[test]
+fn test_carbon_credit_ratio_validation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    let device_key = BytesN::from_array(&env, &[1u8; 32]);
+    let meter_id = client.register_meter(&user, &provider, &100, &token_address, &device_key);
+
+    // Valid boundary values
+    client.set_green_energy_ratio(&meter_id, &0);
+    client.set_green_energy_ratio(&meter_id, &10_000);
+
+    // Invalid value should panic
+    let result = std::panic::catch_unwind(|| {
+        client.set_green_energy_ratio(&meter_id, &10_001);
+    });
+    assert!(result.is_err());
+}

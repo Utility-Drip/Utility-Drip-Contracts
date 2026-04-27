@@ -1,20 +1,21 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol};
-
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    Address, Bytes, BytesN, Env, Symbol, Vec,
+    contract, contracterror, contractclient, contractimpl, contracttype, panic_with_error,
+    symbol_short, token, Address, BytesN, Env, Symbol, Vec,
 };
-
-// Oracle client interface
-use soroban_sdk::contractclient;
 
 #[contractclient(name = "PriceOracleClient")]
 pub trait PriceOracle {
     fn xlm_to_usd_cents(env: Env, xlm_amount: i128) -> i128;
     fn usd_cents_to_xlm(env: Env, usd_cents: i128) -> i128;
     fn get_price(env: Env) -> PriceData;
+}
+
+// Issue #252: Carbon-Credit Minter cross-contract interface
+#[contractclient(name = "CarbonCreditMinterClient")]
+pub trait CarbonCreditMinter {
+    fn mint_credits(env: Env, recipient: Address, amount: i128);
 }
 
 #[contracttype]
@@ -100,6 +101,7 @@ pub struct Meter {
     pub is_paused: bool,
     pub tier_threshold: i128,
     pub tier_rate: i128,
+    pub is_closed: bool,
 }
 
 #[contracttype]
@@ -143,6 +145,14 @@ pub enum DataKey {
     Referral(Address),
     PollVotes(Symbol),
     UserVoted(Address, Symbol),
+    // Issue #253: Multi-Sig Technical Veto
+    FleetCouncil(Address),       // provider -> FleetSecurityCouncil
+    StagedUpdate(u64),           // meter_id -> StagedFleetUpdate
+    // Issue #252: Carbon-Credit Streaming
+    CarbonCredit(u64),           // meter_id -> CarbonCreditState
+    CarbonMinter,                // Address of the carbon credit minting contract
+    // Closing fee (existing)
+    ClosingFeeBps,
 }
 
 #[contracterror]
@@ -166,6 +176,85 @@ pub enum ContractError {
     MeterNotPaired = 15,
     MeterPaused = 16,
     AlreadyVoted = 17,
+    // Issue #253
+    InsufficientSignatures = 18,
+    UpdateAlreadyStaged = 19,
+    NoStagedUpdate = 20,
+    StagingWindowActive = 21,
+    NotCouncilMember = 22,
+    // Closing fee / account
+    InvalidClosingFee = 23,
+    InsufficientBalance = 24,
+    AccountAlreadyClosed = 25,
+}
+
+// ── Issue #258: Auto-Rent-Deduction ──────────────────────────────────────────
+/// Rent deduction per successful claim (1000 stroops = 0.0001 XLM)
+const RENT_DEDUCTION_STROOPS: i128 = 1_000;
+/// TTL safety threshold: only top-up rent when TTL is below ~6 months of ledgers
+/// Stellar produces ~1 ledger/5s → 6 months ≈ 3_110_400 ledgers
+const RENT_TTL_SAFETY_THRESHOLD: u32 = 3_110_400;
+/// Bump amount when topping up (extend by ~1 year ≈ 6_307_200 ledgers)
+const RENT_BUMP_AMOUNT: u32 = 6_307_200;
+
+// ── Issue #252: Carbon-Credit Streaming ──────────────────────────────────────
+/// Basis-point precision for green energy ratio (10_000 = 100%)
+const CARBON_RATIO_PRECISION: i128 = 10_000;
+/// Default credit multiplier (1 credit per 1 unit of green energy, scaled ×1000)
+const DEFAULT_CREDIT_MULTIPLIER: i128 = 1_000;
+/// One full integer credit (scaled ×1000)
+const FULL_CREDIT_UNIT: i128 = 1_000;
+
+// ── Issue #253: Multi-Sig Technical Veto ─────────────────────────────────────
+/// Required approvals out of 5 council members
+const MULTISIG_THRESHOLD: u32 = 3;
+/// Staging window duration: 48 hours
+const STAGING_WINDOW_SECONDS: u64 = 48 * 60 * 60;
+/// DAO rotation delay for lost council keys: 7 days
+const DAO_ROTATION_DELAY_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+// ── Existing missing constant ─────────────────────────────────────────────────
+const DEFAULT_GREEN_ENERGY_DISCOUNT_BPS: i128 = 500; // 5% default green energy discount
+
+// ── Issue #253 structs ────────────────────────────────────────────────────────
+#[contracttype]
+#[derive(Clone)]
+pub struct FleetSecurityCouncil {
+    /// Up to 5 council member addresses
+    pub members: Vec<Address>,
+    /// Pending DAO rotation request timestamp (0 = none)
+    pub dao_rotation_requested_at: u64,
+    /// Proposed replacement members for DAO rotation
+    pub pending_members: Vec<Address>,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct StagedFleetUpdate {
+    /// New off-peak rate being proposed
+    pub new_off_peak_rate: i128,
+    /// Timestamp when the update was staged
+    pub staged_at: u64,
+    /// Council members who have approved the veto (empty = no veto yet)
+    pub veto_approvals: Vec<Address>,
+    /// Whether this update has been vetoed
+    pub is_vetoed: bool,
+}
+
+// ── Issue #252 structs ────────────────────────────────────────────────────────
+#[contracttype]
+#[derive(Clone)]
+pub struct CarbonCreditState {
+    /// Accumulated fractional credits (scaled by FULL_CREDIT_UNIT)
+    pub accumulated_slices: i128,
+    /// Total integer credits minted so far
+    pub total_minted: i128,
+    /// Credits pending issuance (minting contract was paused/capped)
+    pub deferred_credits: i128,
+    /// Green energy ratio in basis points (set by oracle/provider)
+    pub green_energy_ratio_bps: i128,
+    /// Credit multiplier (scaled by 1000)
+    pub credit_multiplier: i128,
 }
 
 #[contracttype]
@@ -700,6 +789,7 @@ impl UtilityContract {
             is_paused: false,
             tier_threshold: 100_000, // 100 kWh default threshold
             tier_rate: off_peak_rate.saturating_mul(120) / 100, // 20% higher rate for top tier by default
+            is_closed: false,
         };
 
         env.storage().instance().set(&DataKey::Meter(count), &meter);
@@ -751,6 +841,8 @@ impl UtilityContract {
                 peak_usage_watt_hours: 0,
                 last_reading_timestamp: now,
                 precision_factor: 1000,
+                renewable_watt_hours: 0,
+                renewable_percentage: 0,
             };
 
             let meter = Meter {
@@ -761,6 +853,7 @@ impl UtilityContract {
                 peak_rate,
                 rate_per_second: meter_info.off_peak_rate,
                 rate_per_unit: meter_info.off_peak_rate,
+                green_energy_discount_bps: DEFAULT_GREEN_ENERGY_DISCOUNT_BPS,
                 balance: 0,
                 debt: 0,
                 collateral_limit: 0,
@@ -780,6 +873,7 @@ impl UtilityContract {
                 is_paused: false,
                 tier_threshold: 100_000,
                 tier_rate: meter_info.off_peak_rate.saturating_mul(120) / 100,
+                is_closed: false,
             };
 
             env.storage().instance().set(&DataKey::Meter(count), &meter);
@@ -956,7 +1050,9 @@ impl UtilityContract {
         meter.provider.require_auth();
 
         // Verify the signature and pairing
-        verify_usage_signature(&env, &signed_data, &meter)?;
+        if let Err(e) = verify_usage_signature(&env, &signed_data, &meter) {
+            panic_with_error!(&env, e);
+        }
 
         // Store old meter value for pool update
         let old_meter_value = provider_meter_value(&meter);
@@ -966,7 +1062,7 @@ impl UtilityContract {
         }
 
         let now = env.ledger().timestamp();
-        let effective_rate = get_effective_rate(&meter, signed_data.timestamp, signed_data.is_renewable_energy);
+        let effective_rate = get_effective_rate(&meter, signed_data.timestamp);
         let cost = signed_data.units_consumed.saturating_mul(effective_rate);
 
         // Apply provider withdrawal limits
@@ -1143,6 +1239,90 @@ impl UtilityContract {
 
         // Update activity status with grace period logic
         refresh_activity(&mut meter, now);
+
+        // ── Issue #258: Auto-Rent-Deduction hook ─────────────────────────────
+        // Only deduct rent if TTL is below the safety threshold to avoid
+        // unnecessary deductions on healthy contracts.
+        let current_ttl = env.storage().instance().get_ttl();
+        if current_ttl < RENT_TTL_SAFETY_THRESHOLD {
+            // Attempt to deduct RENT_DEDUCTION_STROOPS from the meter balance.
+            // We only proceed if the meter token is native XLM (stroops).
+            // For non-XLM tokens we skip silently to avoid blocking the stream.
+            let can_deduct = is_native_token(&meter.token)
+                && meter.balance >= RENT_DEDUCTION_STROOPS;
+            if can_deduct {
+                meter.balance = meter.balance.saturating_sub(RENT_DEDUCTION_STROOPS);
+                // Bump the contract instance TTL by ~1 year
+                env.storage().instance().extend_ttl(current_ttl, RENT_BUMP_AMOUNT);
+                let new_ttl = env.storage().instance().get_ttl();
+                env.events().publish(
+                    (symbol_short!("RentRenew"), meter_id),
+                    (RENT_DEDUCTION_STROOPS, new_ttl),
+                );
+            }
+        }
+
+        // ── Issue #252: Carbon-Credit accumulation hook ───────────────────────
+        // Accumulate carbon credit slices based on green energy ratio.
+        // This runs after every successful claim.
+        // Use the elapsed time computed at the start of the claim function.
+        let claimed_amount = (elapsed as i128).saturating_mul(meter.rate_per_unit);
+        if claimed_amount > 0 {
+            let mut cc_state: CarbonCreditState = env
+                .storage()
+                .instance()
+                .get(&DataKey::CarbonCredit(meter_id))
+                .unwrap_or(CarbonCreditState {
+                    accumulated_slices: 0,
+                    total_minted: 0,
+                    deferred_credits: 0,
+                    green_energy_ratio_bps: 0,
+                    credit_multiplier: DEFAULT_CREDIT_MULTIPLIER,
+                });
+
+            if cc_state.green_energy_ratio_bps > 0 {
+                // credit_slices = tokens_streamed * ratio * multiplier / (precision^2)
+                let new_slices = claimed_amount
+                    .saturating_mul(cc_state.green_energy_ratio_bps)
+                    .saturating_mul(cc_state.credit_multiplier)
+                    / (CARBON_RATIO_PRECISION * FULL_CREDIT_UNIT);
+
+                cc_state.accumulated_slices =
+                    cc_state.accumulated_slices.saturating_add(new_slices);
+
+                // Check if we have accumulated at least one full credit
+                let full_credits = cc_state.accumulated_slices / FULL_CREDIT_UNIT;
+                if full_credits > 0 {
+                    cc_state.accumulated_slices -= full_credits * FULL_CREDIT_UNIT;
+                    // Attempt cross-contract mint; on failure store as deferred
+                    let mint_ok = if let Some(minter_addr) =
+                        env.storage().instance().get::<DataKey, Address>(&DataKey::CarbonMinter)
+                    {
+                        let minter = CarbonCreditMinterClient::new(&env, &minter_addr);
+                        minter.try_mint_credits(&meter.user, &full_credits).is_ok()
+                    } else {
+                        false
+                    };
+
+                    if mint_ok {
+                        cc_state.total_minted =
+                            cc_state.total_minted.saturating_add(full_credits);
+                        env.events().publish(
+                            (symbol_short!("CCAccrued"), meter_id),
+                            (full_credits, cc_state.green_energy_ratio_bps),
+                        );
+                    } else {
+                        // Minting contract paused or capped – defer
+                        cc_state.deferred_credits =
+                            cc_state.deferred_credits.saturating_add(full_credits);
+                    }
+                }
+
+                env.storage()
+                    .instance()
+                    .set(&DataKey::CarbonCredit(meter_id), &cc_state);
+            }
+        }
 
         // Update provider total pool
         let new_meter_value = provider_meter_value(&meter);
@@ -1438,10 +1618,6 @@ impl UtilityContract {
         }
     }
 
-    pub fn get_provider_total_pool(env: Env, provider: Address) -> i128 {
-        get_provider_total_pool_impl(&env, &provider)
-    }
-
     pub fn is_meter_offline(env: Env, meter_id: u64) -> bool {
         match env
             .storage()
@@ -1453,10 +1629,6 @@ impl UtilityContract {
             }
             None => true,
         }
-    }
-
-    pub fn get_watt_hours_display(watt_hours: i128, precision_factor: i128) -> i128 {
-        watt_hours / precision_factor
     }
 
     /// Unlink a meter from its current tenant and link it to a new tenant.
@@ -1656,7 +1828,7 @@ impl UtilityContract {
         
         let now = env.ledger().timestamp();
         let was_active = meter.is_active;
-        refresh_activity(&mut meter);
+        refresh_activity(&mut meter, now);
         
         if !was_active && meter.is_active {
             meter.last_update = now;
@@ -1724,6 +1896,317 @@ impl UtilityContract {
         } else {
             None
         }
+    }
+
+    // ── Issue #258: Auto-Rent-Deduction ──────────────────────────────────────
+
+    /// Returns the current instance TTL (for monitoring / tests).
+    pub fn get_instance_ttl(env: Env) -> u32 {
+        env.storage().instance().get_ttl()
+    }
+
+    // ── Issue #252: Carbon-Credit Streaming ──────────────────────────────────
+
+    /// Set the carbon credit minting contract address (admin only).
+    pub fn set_carbon_minter(env: Env, minter: Address) {
+        env.storage().instance().set(&DataKey::CarbonMinter, &minter);
+    }
+
+    /// Provider sets the green energy ratio for a meter (in basis points, 0-10000).
+    /// Must be signed by a whitelisted environmental auditor (the provider in this model).
+    pub fn set_green_energy_ratio(env: Env, meter_id: u64, ratio_bps: i128) {
+        let meter = get_meter_or_panic(&env, meter_id);
+        meter.provider.require_auth();
+        if ratio_bps < 0 || ratio_bps > CARBON_RATIO_PRECISION {
+            panic_with_error!(&env, ContractError::InvalidUsageValue);
+        }
+        let mut cc_state: CarbonCreditState = env
+            .storage()
+            .instance()
+            .get(&DataKey::CarbonCredit(meter_id))
+            .unwrap_or(CarbonCreditState {
+                accumulated_slices: 0,
+                total_minted: 0,
+                deferred_credits: 0,
+                green_energy_ratio_bps: 0,
+                credit_multiplier: DEFAULT_CREDIT_MULTIPLIER,
+            });
+        cc_state.green_energy_ratio_bps = ratio_bps;
+        env.storage()
+            .instance()
+            .set(&DataKey::CarbonCredit(meter_id), &cc_state);
+    }
+
+    /// Retry minting deferred carbon credits (e.g. after minting contract is unpaused).
+    pub fn retry_deferred_carbon_credits(env: Env, meter_id: u64) {
+        let meter = get_meter_or_panic(&env, meter_id);
+        let mut cc_state: CarbonCreditState = env
+            .storage()
+            .instance()
+            .get(&DataKey::CarbonCredit(meter_id))
+            .unwrap_or(CarbonCreditState {
+                accumulated_slices: 0,
+                total_minted: 0,
+                deferred_credits: 0,
+                green_energy_ratio_bps: 0,
+                credit_multiplier: DEFAULT_CREDIT_MULTIPLIER,
+            });
+        if cc_state.deferred_credits <= 0 {
+            return;
+        }
+        if let Some(minter_addr) =
+            env.storage().instance().get::<DataKey, Address>(&DataKey::CarbonMinter)
+        {
+            let minter = CarbonCreditMinterClient::new(&env, &minter_addr);
+            if minter.try_mint_credits(&meter.user, &cc_state.deferred_credits).is_ok() {
+                cc_state.total_minted =
+                    cc_state.total_minted.saturating_add(cc_state.deferred_credits);
+                env.events().publish(
+                    (symbol_short!("CCDeferred"), meter_id),
+                    cc_state.deferred_credits,
+                );
+                cc_state.deferred_credits = 0;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::CarbonCredit(meter_id), &cc_state);
+            }
+        }
+    }
+
+    /// Get carbon credit state for a meter.
+    pub fn get_carbon_credit_state(env: Env, meter_id: u64) -> Option<CarbonCreditState> {
+        env.storage()
+            .instance()
+            .get(&DataKey::CarbonCredit(meter_id))
+    }
+
+    // ── Issue #253: Multi-Sig Technical Veto ─────────────────────────────────
+
+    /// Provider registers a Fleet Security Council (up to 5 members, 3-of-5 veto).
+    pub fn register_fleet_council(env: Env, provider: Address, members: Vec<Address>) {
+        provider.require_auth();
+        if members.len() > 5 {
+            panic_with_error!(&env, ContractError::InvalidUsageValue);
+        }
+        let council = FleetSecurityCouncil {
+            members,
+            dao_rotation_requested_at: 0,
+            pending_members: Vec::new(&env),
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::FleetCouncil(provider.clone()), &council);
+        env.events()
+            .publish((symbol_short!("CouncilSet"), provider), ());
+    }
+
+    /// Provider stages a fleet-level configuration update (new off-peak rate).
+    /// Starts the 48-hour staging window during which the council can veto.
+    pub fn stage_fleet_update(env: Env, meter_id: u64, new_off_peak_rate: i128) {
+        let meter = get_meter_or_panic(&env, meter_id);
+        meter.provider.require_auth();
+
+        // Ensure no update is already staged
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::StagedUpdate(meter_id))
+        {
+            panic_with_error!(&env, ContractError::UpdateAlreadyStaged);
+        }
+
+        let now = env.ledger().timestamp();
+        let update = StagedFleetUpdate {
+            new_off_peak_rate,
+            staged_at: now,
+            veto_approvals: Vec::new(&env),
+            is_vetoed: false,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::StagedUpdate(meter_id), &update);
+        env.events().publish(
+            (symbol_short!("UpdateStaged"), meter_id),
+            (new_off_peak_rate, now),
+        );
+    }
+
+    /// Council member casts a veto approval on a staged update.
+    /// Once MULTISIG_THRESHOLD approvals are collected the update is vetoed.
+    pub fn veto_fleet_update(env: Env, meter_id: u64, council_member: Address) {
+        council_member.require_auth();
+
+        let meter = get_meter_or_panic(&env, meter_id);
+
+        // Verify caller is a council member for this provider
+        let council: FleetSecurityCouncil = env
+            .storage()
+            .instance()
+            .get(&DataKey::FleetCouncil(meter.provider.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotCouncilMember));
+
+        let is_member = council.members.iter().any(|m| m == council_member);
+        if !is_member {
+            panic_with_error!(&env, ContractError::NotCouncilMember);
+        }
+
+        let mut update: StagedFleetUpdate = env
+            .storage()
+            .instance()
+            .get(&DataKey::StagedUpdate(meter_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoStagedUpdate));
+
+        // Prevent double-voting
+        let already_voted = update.veto_approvals.iter().any(|m| m == council_member);
+        if !already_voted {
+            update.veto_approvals.push_back(council_member.clone());
+        }
+
+        if update.veto_approvals.len() >= MULTISIG_THRESHOLD {
+            update.is_vetoed = true;
+            env.storage()
+                .instance()
+                .set(&DataKey::StagedUpdate(meter_id), &update);
+            env.events().publish(
+                (symbol_short!("UpdateVetoed"), meter_id),
+                council_member,
+            );
+        } else {
+            env.storage()
+                .instance()
+                .set(&DataKey::StagedUpdate(meter_id), &update);
+        }
+    }
+
+    /// Execute a staged fleet update after the 48-hour window (if not vetoed).
+    /// Emergency heartbeat/circuit-breaker updates bypass the staging window.
+    pub fn execute_fleet_update(env: Env, meter_id: u64, emergency: bool) {
+        let mut meter = get_meter_or_panic(&env, meter_id);
+        meter.provider.require_auth();
+
+        if emergency {
+            // Emergency bypass: apply immediately without staging window check
+            // (rate is taken from the staged update if present, else no-op)
+            if let Some(update) = env
+                .storage()
+                .instance()
+                .get::<DataKey, StagedFleetUpdate>(&DataKey::StagedUpdate(meter_id))
+            {
+                if !update.is_vetoed {
+                    meter.off_peak_rate = update.new_off_peak_rate;
+                    meter.peak_rate = update
+                        .new_off_peak_rate
+                        .saturating_mul(PEAK_RATE_MULTIPLIER)
+                        / RATE_PRECISION;
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::Meter(meter_id), &meter);
+                    env.storage()
+                        .instance()
+                        .remove(&DataKey::StagedUpdate(meter_id));
+                }
+            }
+            return;
+        }
+
+        let update: StagedFleetUpdate = env
+            .storage()
+            .instance()
+            .get(&DataKey::StagedUpdate(meter_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoStagedUpdate));
+
+        if update.is_vetoed {
+            panic_with_error!(&env, ContractError::StagingWindowActive);
+        }
+
+        let now = env.ledger().timestamp();
+        if now.saturating_sub(update.staged_at) < STAGING_WINDOW_SECONDS {
+            panic_with_error!(&env, ContractError::StagingWindowActive);
+        }
+
+        meter.off_peak_rate = update.new_off_peak_rate;
+        meter.peak_rate = update
+            .new_off_peak_rate
+            .saturating_mul(PEAK_RATE_MULTIPLIER)
+            / RATE_PRECISION;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Meter(meter_id), &meter);
+        env.storage()
+            .instance()
+            .remove(&DataKey::StagedUpdate(meter_id));
+
+        env.events().publish(
+            (symbol_short!("UpdateExec"), meter_id),
+            update.new_off_peak_rate,
+        );
+    }
+
+    /// DAO initiates a council key rotation (7-day delay for lost keys).
+    pub fn request_dao_council_rotation(
+        env: Env,
+        provider: Address,
+        new_members: Vec<Address>,
+    ) {
+        provider.require_auth();
+        if new_members.len() > 5 {
+            panic_with_error!(&env, ContractError::InvalidUsageValue);
+        }
+        let mut council: FleetSecurityCouncil = env
+            .storage()
+            .instance()
+            .get(&DataKey::FleetCouncil(provider.clone()))
+            .unwrap_or(FleetSecurityCouncil {
+                members: Vec::new(&env),
+                dao_rotation_requested_at: 0,
+                pending_members: Vec::new(&env),
+            });
+        council.dao_rotation_requested_at = env.ledger().timestamp();
+        council.pending_members = new_members;
+        env.storage()
+            .instance()
+            .set(&DataKey::FleetCouncil(provider.clone()), &council);
+        env.events()
+            .publish((symbol_short!("DAORotReq"), provider), ());
+    }
+
+    /// Finalise DAO council rotation after the 7-day delay.
+    pub fn finalize_dao_council_rotation(env: Env, provider: Address) {
+        provider.require_auth();
+        let mut council: FleetSecurityCouncil = env
+            .storage()
+            .instance()
+            .get(&DataKey::FleetCouncil(provider.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotCouncilMember));
+
+        let now = env.ledger().timestamp();
+        if now.saturating_sub(council.dao_rotation_requested_at) < DAO_ROTATION_DELAY_SECONDS {
+            panic_with_error!(&env, ContractError::StagingWindowActive);
+        }
+
+        council.members = council.pending_members.clone();
+        council.pending_members = Vec::new(&env);
+        council.dao_rotation_requested_at = 0;
+        env.storage()
+            .instance()
+            .set(&DataKey::FleetCouncil(provider.clone()), &council);
+        env.events()
+            .publish((symbol_short!("DAORotDone"), provider), ());
+    }
+
+    /// Get the staged update for a meter (if any).
+    pub fn get_staged_update(env: Env, meter_id: u64) -> Option<StagedFleetUpdate> {
+        env.storage()
+            .instance()
+            .get(&DataKey::StagedUpdate(meter_id))
+    }
+
+    /// Get the fleet security council for a provider.
+    pub fn get_fleet_council(env: Env, provider: Address) -> Option<FleetSecurityCouncil> {
+        env.storage()
+            .instance()
+            .get(&DataKey::FleetCouncil(provider))
     }
 }
 

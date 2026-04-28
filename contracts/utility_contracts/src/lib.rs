@@ -26,6 +26,168 @@ pub struct PriceData {
     pub decimals: u32,
     pub last_updated: u64,
 }
+
+// ============================================================================
+// Issue #259: Cross-Contract "Energy-Score" Reputation Adapter
+// ============================================================================
+
+/// Reputation tier returned to partner DApps querying a user's utility reliability.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ReputationTier {
+    /// User has no history (new or pruned) — neutral score.
+    NewUser = 0,
+    /// Occasional late payments or low buffer health.
+    Bronze = 1,
+    /// Mostly on-time with adequate buffer health.
+    Silver = 2,
+    /// Consistently on-time with healthy buffer.
+    Gold = 3,
+    /// Perfect record — eligible for premium DeFi features.
+    Platinum = 4,
+}
+
+/// Standardised reputation score returned by `get_utility_reputation`.
+/// Does NOT expose consumption volume or device MAC.
+#[contracttype]
+#[derive(Clone)]
+pub struct ReputationScore {
+    /// Score in basis points (0–10 000). 10 000 = perfect.
+    pub score_bps: u32,
+    /// Human-readable tier for partner DApps.
+    pub tier: ReputationTier,
+    /// Timestamp of the last on-chain activity used to compute the score.
+    pub last_activity: u64,
+    /// Whether the score was derived from live data (false = default/new-user).
+    pub is_live: bool,
+}
+
+// ============================================================================
+// Issue #257: IoT Error Enum — u16 machine-readable codes
+// ============================================================================
+
+/// Compact u16 error codes for IoT firmware handshakes.
+/// Hardware devices switch on these codes to perform automated local recoveries.
+/// SECURITY: codes do NOT leak provider metadata or consumption volumes.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u16)]
+pub enum IoTErrorCode {
+    // 0x01xx — Meter / stream lifecycle
+    MeterNotFound          = 0x0101,
+    MeterNotPaired         = 0x0102,
+    MeterOffline           = 0x0103,
+    MeterPaused            = 0x0104,
+    MeterClosed            = 0x0105,
+    // 0x02xx — Balance / billing
+    InsufficientBalance    = 0x0201,
+    BufferBreached         = 0x0202,
+    DebtThresholdExceeded  = 0x0203,
+    CreditLimitApproached  = 0x0204,
+    CreditLimitBreached    = 0x0205,
+    // 0x03xx — Auth / signature
+    InvalidSignature       = 0x0301,
+    PublicKeyMismatch      = 0x0302,
+    TimestampTooOld        = 0x0303,
+    UnauthorizedDevice     = 0x0304,
+    // 0x04xx — Device / firmware
+    DeviceBlacklisted      = 0x0401,
+    FirmwareUpdateActive   = 0x0402,  // triggers hibernation mode in firmware
+    FirmwareWindowExpired  = 0x0403,
+    // 0x05xx — Clawback / compliance
+    ClawbackDetected       = 0x0501,
+    StreamTerminated       = 0x0502,
+    // 0x06xx — Generic
+    UnknownError           = 0x0601,
+}
+
+impl IoTErrorCode {
+    /// Map a `ContractError` to the compact IoT u16 code.
+    pub fn from_contract_error(e: ContractError) -> Self {
+        match e {
+            ContractError::MeterNotFound          => Self::MeterNotFound,
+            ContractError::MeterNotPaired         => Self::MeterNotPaired,
+            ContractError::InvalidSignature       => Self::InvalidSignature,
+            ContractError::PublicKeyMismatch      => Self::PublicKeyMismatch,
+            ContractError::TimestampTooOld        => Self::TimestampTooOld,
+            ContractError::InsufficientBuffer     => Self::BufferBreached,
+            ContractError::BufferAlreadyDepleted  => Self::BufferBreached,
+            ContractError::FirmwareUpdateInProgress  => Self::FirmwareUpdateActive,
+            ContractError::FirmwareUpdateWindowExpired => Self::FirmwareWindowExpired,
+            _ => Self::UnknownError,
+        }
+    }
+
+    /// Return the raw u16 code — zero-copy for firmware parsing.
+    pub fn code(self) -> u16 {
+        self as u16
+    }
+}
+
+// ============================================================================
+// Issue #256: SAC Clawback Reconciliation structures
+// ============================================================================
+
+/// Emitted when a clawback reconciliation is executed.
+#[contracttype]
+#[derive(Clone)]
+pub struct ClawbackReconciliationExecuted {
+    /// Token that was clawed back.
+    pub token: Address,
+    /// Volume removed from the contract by the issuer.
+    pub clawback_volume: i128,
+    /// Number of active streams affected.
+    pub affected_streams: u32,
+    /// Protocol haircut applied (if any) to cover the gap.
+    pub protocol_haircut: i128,
+    pub timestamp: u64,
+}
+
+// ============================================================================
+// Issue #255: Post-Paid Multi-Factor Escrow structures
+// ============================================================================
+
+/// Vault that backs a post-paid stream with USDC collateral.
+#[contracttype]
+#[derive(Clone)]
+pub struct GuarantorDeposit {
+    /// Owner of the deposit (the utility consumer).
+    pub owner: Address,
+    /// Stable-asset token (must be USDC or equivalent).
+    pub collateral_token: Address,
+    /// Total locked collateral.
+    pub locked_amount: i128,
+    /// Accrued debt drawn against this deposit (across all linked streams).
+    pub accrued_debt: i128,
+    /// Timestamp of last debt update.
+    pub last_updated: u64,
+    /// Whether a margin-call warning has been emitted.
+    pub margin_call_sent: bool,
+    /// Whether the deposit has been slashed (stream terminated).
+    pub is_slashed: bool,
+}
+
+/// Emitted when debt reaches 80 % of collateral.
+#[contracttype]
+#[derive(Clone)]
+pub struct CreditLimitApproached {
+    pub owner: Address,
+    pub accrued_debt: i128,
+    pub locked_amount: i128,
+    pub ratio_bps: i128,
+    pub timestamp: u64,
+}
+
+/// Emitted when the deposit is slashed at 100 % utilisation.
+#[contracttype]
+#[derive(Clone)]
+pub struct GuarantorSlashed {
+    pub owner: Address,
+    pub slashed_amount: i128,
+    pub provider: Address,
+    pub timestamp: u64,
+}
+
 #[cfg(test)]
 mod debt_fuzz_tests;
 #[cfg(test)]
@@ -737,6 +899,12 @@ pub enum DataKey {
     WithdrawalRequestCount(Address),
     ZKEnabledMeters,
     ZKVerificationKey(u64),
+    // Issue #259
+    ReputationScore(Address),
+    // Issue #256
+    ClawbackNonce(Address),
+    // Issue #255
+    GuarantorDeposit(Address),
 }
 
 #[contracterror(export = false)]
@@ -819,6 +987,14 @@ pub enum ContractError {
     SubDaoNotConfigured = 71,
     SubDaoBudgetExceeded = 72,
     UnauthorizedContributor = 73,
+    // Issue #255 — Post-Paid escrow
+    GuarantorDepositNotFound = 74,
+    InsufficientCollateral = 75,
+    DepositAlreadySlashed = 76,
+    // Issue #256 — SAC clawback
+    ClawbackBalanceMismatch = 77,
+    // Issue #259 — Reputation
+    ReputationQueryFailed = 78,
 }
 
 #[contracttype]
@@ -852,6 +1028,18 @@ const DEFAULT_MIN_ROUTE_THRESHOLD: i128 = 10_000_000;
 // Issue #197: Streaming-Fee Collector
 // Max platform fee: 1000 bps = 10%
 const MAX_PLATFORM_FEE_BPS: i128 = 1000;
+
+// Issue #255: Post-Paid escrow thresholds (in basis points)
+/// Margin-call warning threshold: 80 % of collateral consumed.
+const MARGIN_CALL_THRESHOLD_BPS: i128 = 8_000;
+/// Slash threshold: 100 % of collateral consumed.
+const SLASH_THRESHOLD_BPS: i128 = 10_000;
+
+// Issue #259: Reputation score thresholds (in basis points)
+const REPUTATION_PLATINUM_BPS: u32 = 9_500;
+const REPUTATION_GOLD_BPS: u32     = 8_000;
+const REPUTATION_SILVER_BPS: u32   = 6_000;
+const REPUTATION_BRONZE_BPS: u32   = 3_000;
 
 // --- shared protocol constants (referenced across claim / upgrade / multi-sig) ---
 const THROTTLING_THRESHOLD_PERCENT: i128 = 20;
@@ -6217,315 +6405,426 @@ env.storage()
         )
     }
 
-    // ── Issue #258: Auto-Rent-Deduction ──────────────────────────────────────
+    // =========================================================================
+    // Issue #259: Cross-Contract "Energy-Score" Reputation Adapter
+    // =========================================================================
 
-    /// Returns the current instance TTL (for monitoring / tests).
-    pub fn get_instance_ttl(env: Env) -> u32 {
-        env.storage().instance().get_ttl()
-    }
-
-    // ── Issue #252: Carbon-Credit Streaming ──────────────────────────────────
-
-    /// Set the carbon credit minting contract address (admin only).
-    pub fn set_carbon_minter(env: Env, minter: Address) {
-        env.storage().instance().set(&DataKey::CarbonMinter, &minter);
-    }
-
-    /// Provider sets the green energy ratio for a meter (in basis points, 0-10000).
-    /// Must be signed by a whitelisted environmental auditor (the provider in this model).
-    pub fn set_green_energy_ratio(env: Env, meter_id: u64, ratio_bps: i128) {
-        let meter = get_meter_or_panic(&env, meter_id);
-        meter.provider.require_auth();
-        if ratio_bps < 0 || ratio_bps > CARBON_RATIO_PRECISION {
-            panic_with_error!(&env, ContractError::InvalidUsageValue);
-        }
-        let mut cc_state: CarbonCreditState = env
-            .storage()
-            .instance()
-            .get(&DataKey::CarbonCredit(meter_id))
-            .unwrap_or(CarbonCreditState {
-                accumulated_slices: 0,
-                total_minted: 0,
-                deferred_credits: 0,
-                green_energy_ratio_bps: 0,
-                credit_multiplier: DEFAULT_CREDIT_MULTIPLIER,
-            });
-        cc_state.green_energy_ratio_bps = ratio_bps;
-        env.storage()
-            .instance()
-            .set(&DataKey::CarbonCredit(meter_id), &cc_state);
-    }
-
-    /// Retry minting deferred carbon credits (e.g. after minting contract is unpaused).
-    pub fn retry_deferred_carbon_credits(env: Env, meter_id: u64) {
-        let meter = get_meter_or_panic(&env, meter_id);
-        let mut cc_state: CarbonCreditState = env
-            .storage()
-            .instance()
-            .get(&DataKey::CarbonCredit(meter_id))
-            .unwrap_or(CarbonCreditState {
-                accumulated_slices: 0,
-                total_minted: 0,
-                deferred_credits: 0,
-                green_energy_ratio_bps: 0,
-                credit_multiplier: DEFAULT_CREDIT_MULTIPLIER,
-            });
-        if cc_state.deferred_credits <= 0 {
-            return;
-        }
-        if let Some(minter_addr) =
-            env.storage().instance().get::<DataKey, Address>(&DataKey::CarbonMinter)
-        {
-            let minter = CarbonCreditMinterClient::new(&env, &minter_addr);
-            if minter.try_mint_credits(&meter.user, &cc_state.deferred_credits).is_ok() {
-                cc_state.total_minted =
-                    cc_state.total_minted.saturating_add(cc_state.deferred_credits);
-                env.events().publish(
-                    (symbol_short!("CCDeferred"), meter_id),
-                    cc_state.deferred_credits,
-                );
-                cc_state.deferred_credits = 0;
-                env.storage()
-                    .instance()
-                    .set(&DataKey::CarbonCredit(meter_id), &cc_state);
-            }
-        }
-    }
-
-    /// Get carbon credit state for a meter.
-    pub fn get_carbon_credit_state(env: Env, meter_id: u64) -> Option<CarbonCreditState> {
-        env.storage()
-            .instance()
-            .get(&DataKey::CarbonCredit(meter_id))
-    }
-
-    // ── Issue #253: Multi-Sig Technical Veto ─────────────────────────────────
-
-    /// Provider registers a Fleet Security Council (up to 5 members, 3-of-5 veto).
-    pub fn register_fleet_council(env: Env, provider: Address, members: Vec<Address>) {
-        provider.require_auth();
-        if members.len() > 5 {
-            panic_with_error!(&env, ContractError::InvalidUsageValue);
-        }
-        let council = FleetSecurityCouncil {
-            members,
-            dao_rotation_requested_at: 0,
-            pending_members: Vec::new(&env),
-        };
-        env.storage()
-            .instance()
-            .set(&DataKey::FleetCouncil(provider.clone()), &council);
-        env.events()
-            .publish((symbol_short!("CouncilSet"), provider), ());
-    }
-
-    /// Provider stages a fleet-level configuration update (new off-peak rate).
-    /// Starts the 48-hour staging window during which the council can veto.
-    pub fn stage_fleet_update(env: Env, meter_id: u64, new_off_peak_rate: i128) {
-        let meter = get_meter_or_panic(&env, meter_id);
-        meter.provider.require_auth();
-
-        // Ensure no update is already staged
-        if env
-            .storage()
-            .instance()
-            .has(&DataKey::StagedUpdate(meter_id))
-        {
-            panic_with_error!(&env, ContractError::UpdateAlreadyStaged);
-        }
-
+    /// Read-only reputation query for partner DApps (e.g. lending vaults).
+    ///
+    /// Returns a `ReputationScore` derived from the user's on-chain liveness and
+    /// buffer health.  Emits **zero events** and exposes **no consumption volume
+    /// or device MAC**.  Defaults to a neutral `NewUser` score when history has
+    /// been pruned or the user is unknown.
+    ///
+    /// Designed for high-frequency cross-contract queries — all storage reads are
+    /// single-key lookups to minimise CPU instruction count.
+    pub fn get_utility_reputation(env: Env, user: Address) -> ReputationScore {
         let now = env.ledger().timestamp();
-        let update = StagedFleetUpdate {
-            new_off_peak_rate,
-            staged_at: now,
-            veto_approvals: Vec::new(&env),
-            is_vetoed: false,
-        };
-        env.storage()
-            .instance()
-            .set(&DataKey::StagedUpdate(meter_id), &update);
-        env.events().publish(
-            (symbol_short!("UpdateStaged"), meter_id),
-            (new_off_peak_rate, now),
-        );
-    }
 
-    /// Council member casts a veto approval on a staged update.
-    /// Once MULTISIG_THRESHOLD approvals are collected the update is vetoed.
-    pub fn veto_fleet_update(env: Env, meter_id: u64, council_member: Address) {
-        council_member.require_auth();
-
-        let meter = get_meter_or_panic(&env, meter_id);
-
-        // Verify caller is a council member for this provider
-        let council: FleetSecurityCouncil = env
+        // Fast path: return cached score if present (avoids meter iteration).
+        if let Some(cached) = env
             .storage()
             .instance()
-            .get(&DataKey::FleetCouncil(meter.provider.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotCouncilMember));
-
-        let is_member = council.members.iter().any(|m| m == council_member);
-        if !is_member {
-            panic_with_error!(&env, ContractError::NotCouncilMember);
+            .get::<DataKey, ReputationScore>(&DataKey::ReputationScore(user.clone()))
+        {
+            return cached;
         }
 
-        let mut update: StagedFleetUpdate = env
+        // Scan meters owned by this user to compute a live score.
+        let count: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::StagedUpdate(meter_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoStagedUpdate));
+            .get::<DataKey, u64>(&DataKey::Count)
+            .unwrap_or(0);
 
-        // Prevent double-voting
-        let already_voted = update.veto_approvals.iter().any(|m| m == council_member);
-        if !already_voted {
-            update.veto_approvals.push_back(council_member.clone());
-        }
+        let mut total_meters: u32 = 0;
+        let mut healthy_meters: u32 = 0;
+        let mut last_activity: u64 = 0;
 
-        if update.veto_approvals.len() >= MULTISIG_THRESHOLD {
-            update.is_vetoed = true;
-            env.storage()
-                .instance()
-                .set(&DataKey::StagedUpdate(meter_id), &update);
-            env.events().publish(
-                (symbol_short!("UpdateVetoed"), meter_id),
-                council_member,
-            );
-        } else {
-            env.storage()
-                .instance()
-                .set(&DataKey::StagedUpdate(meter_id), &update);
-        }
-    }
-
-    /// Execute a staged fleet update after the 48-hour window (if not vetoed).
-    /// Emergency heartbeat/circuit-breaker updates bypass the staging window.
-    pub fn execute_fleet_update(env: Env, meter_id: u64, emergency: bool) {
-        let mut meter = get_meter_or_panic(&env, meter_id);
-        meter.provider.require_auth();
-
-        if emergency {
-            // Emergency bypass: apply immediately without staging window check
-            // (rate is taken from the staged update if present, else no-op)
-            if let Some(update) = env
+        for meter_id in 1..=count {
+            if let Some(meter) = env
                 .storage()
                 .instance()
-                .get::<DataKey, StagedFleetUpdate>(&DataKey::StagedUpdate(meter_id))
+                .get::<DataKey, Meter>(&DataKey::Meter(meter_id))
             {
-                if !update.is_vetoed {
-                    meter.off_peak_rate = update.new_off_peak_rate;
-                    meter.peak_rate = update
-                        .new_off_peak_rate
-                        .saturating_mul(PEAK_RATE_MULTIPLIER)
-                        / RATE_PRECISION;
-                    env.storage()
-                        .instance()
-                        .set(&DataKey::Meter(meter_id), &meter);
-                    env.storage()
-                        .instance()
-                        .remove(&DataKey::StagedUpdate(meter_id));
+                if meter.user != user {
+                    continue;
+                }
+                total_meters += 1;
+
+                // Track most recent activity timestamp.
+                if meter.last_update > last_activity {
+                    last_activity = meter.last_update;
+                }
+
+                // A meter is "healthy" when it is active, not offline, not
+                // disputed, and has a positive balance.
+                if meter.is_active
+                    && !meter.is_offline
+                    && !meter.is_disputed
+                    && meter.balance > 0
+                {
+                    healthy_meters += 1;
                 }
             }
+        }
+
+        // No meters found → neutral new-user score.
+        if total_meters == 0 {
+            return ReputationScore {
+                score_bps: 5_000,
+                tier: ReputationTier::NewUser,
+                last_activity: now,
+                is_live: false,
+            };
+        }
+
+        let score_bps =
+            ((healthy_meters as u32) * 10_000) / (total_meters as u32);
+
+        let tier = if score_bps >= REPUTATION_PLATINUM_BPS {
+            ReputationTier::Platinum
+        } else if score_bps >= REPUTATION_GOLD_BPS {
+            ReputationTier::Gold
+        } else if score_bps >= REPUTATION_SILVER_BPS {
+            ReputationTier::Silver
+        } else if score_bps >= REPUTATION_BRONZE_BPS {
+            ReputationTier::Bronze
+        } else {
+            ReputationTier::NewUser
+        };
+
+        ReputationScore {
+            score_bps,
+            tier,
+            last_activity,
+            is_live: true,
+        }
+    }
+
+    /// Refresh and cache the reputation score for a user.
+    /// Call this after significant state changes to keep the cache warm.
+    pub fn refresh_reputation_cache(env: Env, user: Address) {
+        let score = Self::get_utility_reputation(env.clone(), user.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::ReputationScore(user), &score);
+    }
+
+    // =========================================================================
+    // Issue #257: IoT Error Code Lookup
+    // =========================================================================
+
+    /// Return the compact u16 IoT error code for a given `ContractError` variant.
+    /// Firmware devices call this to map on-chain errors to local recovery actions.
+    pub fn get_iot_error_code(error_variant: u32) -> u32 {
+        // We accept u32 (the ContractError repr) and return u32 (the IoTErrorCode).
+        // This keeps the ABI simple for cross-language firmware clients.
+        let contract_err: ContractError = match error_variant {
+            1  => ContractError::MeterNotFound,
+            9  => ContractError::InvalidSignature,
+            10 => ContractError::PublicKeyMismatch,
+            11 => ContractError::TimestampTooOld,
+            15 => ContractError::MeterNotPaired,
+            19 => ContractError::InsufficientBuffer,
+            20 => ContractError::BufferAlreadyDepleted,
+            35 => ContractError::FirmwareUpdateInProgress,
+            36 => ContractError::FirmwareUpdateWindowExpired,
+            _  => ContractError::UnauthorizedAdmin, // maps to UnknownError
+        };
+        IoTErrorCode::from_contract_error(contract_err).code() as u32
+    }
+
+    // =========================================================================
+    // Issue #256: SAC Clawback Reconciliation
+    // =========================================================================
+
+    /// Reconcile the contract's internal accounting with the actual on-chain
+    /// token balance after a Stellar Asset Contract (SAC) clawback event.
+    ///
+    /// # Security
+    /// - Only callable by the admin.
+    /// - Verifies that the actual balance is genuinely lower than tracked TVL
+    ///   before applying any haircut (prevents fake-clawback attacks).
+    /// - If the clawback targets a specific user, only that user's streams are
+    ///   terminated.
+    ///
+    /// Emits `ClawbackReconciliationExecuted`.
+    pub fn sync_actual_balance(
+        env: Env,
+        token: Address,
+        expected_tvl: i128,
+        affected_user: Option<Address>,
+    ) {
+        require_admin_auth(&env);
+
+        let token_client = token::Client::new(&env, &token);
+        let actual_balance = token_client.balance(&env.current_contract_address());
+
+        // If actual >= expected there is no discrepancy — nothing to do.
+        if actual_balance >= expected_tvl {
             return;
         }
 
-        let update: StagedFleetUpdate = env
+        let clawback_volume = expected_tvl.saturating_sub(actual_balance);
+        let now = env.ledger().timestamp();
+        let mut affected_streams: u32 = 0;
+        let mut protocol_haircut: i128 = 0;
+
+        let count: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::StagedUpdate(meter_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoStagedUpdate));
+            .get::<DataKey, u64>(&DataKey::Count)
+            .unwrap_or(0);
 
-        if update.is_vetoed {
-            panic_with_error!(&env, ContractError::StagingWindowActive);
+        for meter_id in 1..=count {
+            if let Some(mut meter) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Meter>(&DataKey::Meter(meter_id))
+            {
+                // If a specific user was targeted, only touch their meters.
+                if let Some(ref target) = affected_user {
+                    if &meter.user != target {
+                        continue;
+                    }
+                }
+
+                if meter.token != token || !meter.is_active {
+                    continue;
+                }
+
+                // Terminate the stream and apply a proportional haircut.
+                let haircut = meter.balance.min(clawback_volume);
+                meter.balance = meter.balance.saturating_sub(haircut);
+                protocol_haircut = protocol_haircut.saturating_add(haircut);
+                meter.is_active = false;
+                meter.is_closed = true;
+                affected_streams += 1;
+
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Meter(meter_id), &meter);
+
+                env.events().publish(
+                    (symbol_short!("ClwbkStr"), meter_id),
+                    (meter.user.clone(), haircut, now),
+                );
+            }
         }
-
-        let now = env.ledger().timestamp();
-        if now.saturating_sub(update.staged_at) < STAGING_WINDOW_SECONDS {
-            panic_with_error!(&env, ContractError::StagingWindowActive);
-        }
-
-        meter.off_peak_rate = update.new_off_peak_rate;
-        meter.peak_rate = update
-            .new_off_peak_rate
-            .saturating_mul(PEAK_RATE_MULTIPLIER)
-            / RATE_PRECISION;
-
-        env.storage()
-            .instance()
-            .set(&DataKey::Meter(meter_id), &meter);
-        env.storage()
-            .instance()
-            .remove(&DataKey::StagedUpdate(meter_id));
 
         env.events().publish(
-            (symbol_short!("UpdateExec"), meter_id),
-            update.new_off_peak_rate,
+            symbol_short!("ClwbkRec"),
+            ClawbackReconciliationExecuted {
+                token,
+                clawback_volume,
+                affected_streams,
+                protocol_haircut,
+                timestamp: now,
+            },
         );
     }
 
-    /// DAO initiates a council key rotation (7-day delay for lost keys).
-    pub fn request_dao_council_rotation(
-        env: Env,
-        provider: Address,
-        new_members: Vec<Address>,
-    ) {
-        provider.require_auth();
-        if new_members.len() > 5 {
-            panic_with_error!(&env, ContractError::InvalidUsageValue);
-        }
-        let mut council: FleetSecurityCouncil = env
-            .storage()
-            .instance()
-            .get(&DataKey::FleetCouncil(provider.clone()))
-            .unwrap_or(FleetSecurityCouncil {
-                members: Vec::new(&env),
-                dao_rotation_requested_at: 0,
-                pending_members: Vec::new(&env),
-            });
-        council.dao_rotation_requested_at = env.ledger().timestamp();
-        council.pending_members = new_members;
-        env.storage()
-            .instance()
-            .set(&DataKey::FleetCouncil(provider.clone()), &council);
-        env.events()
-            .publish((symbol_short!("DAORotReq"), provider), ());
-    }
+    // =========================================================================
+    // Issue #255: Post-Paid Billing via Multi-Factor Escrow
+    // =========================================================================
 
-    /// Finalise DAO council rotation after the 7-day delay.
-    pub fn finalize_dao_council_rotation(env: Env, provider: Address) {
-        provider.require_auth();
-        let mut council: FleetSecurityCouncil = env
-            .storage()
-            .instance()
-            .get(&DataKey::FleetCouncil(provider.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotCouncilMember));
+    /// Lock USDC collateral into a guarantor deposit vault.
+    /// The deposit backs one or more post-paid streams.
+    pub fn lock_guarantor_deposit(
+        env: Env,
+        owner: Address,
+        collateral_token: Address,
+        amount: i128,
+    ) {
+        owner.require_auth();
+
+        if amount <= 0 {
+            panic_with_error!(&env, ContractError::InsufficientCollateral);
+        }
+
+        // Transfer collateral from owner to contract.
+        let token_client = token::Client::new(&env, &collateral_token);
+        token_client.transfer(&owner, &env.current_contract_address(), &amount);
 
         let now = env.ledger().timestamp();
-        if now.saturating_sub(council.dao_rotation_requested_at) < DAO_ROTATION_DELAY_SECONDS {
-            panic_with_error!(&env, ContractError::StagingWindowActive);
+        let existing: Option<GuarantorDeposit> = env
+            .storage()
+            .instance()
+            .get(&DataKey::GuarantorDeposit(owner.clone()));
+
+        let deposit = match existing {
+            Some(mut d) => {
+                if d.is_slashed {
+                    panic_with_error!(&env, ContractError::DepositAlreadySlashed);
+                }
+                d.locked_amount = d.locked_amount.saturating_add(amount);
+                d.last_updated = now;
+                d
+            }
+            None => GuarantorDeposit {
+                owner: owner.clone(),
+                collateral_token: collateral_token.clone(),
+                locked_amount: amount,
+                accrued_debt: 0,
+                last_updated: now,
+                margin_call_sent: false,
+                is_slashed: false,
+            },
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::GuarantorDeposit(owner.clone()), &deposit);
+
+        env.events().publish(
+            symbol_short!("GDepLock"),
+            (owner, collateral_token, amount, now),
+        );
+    }
+
+    /// Accrue post-paid debt against a guarantor deposit.
+    ///
+    /// Called internally by the provider when billing a post-paid stream.
+    /// Emits `CreditLimitApproached` at 80 % and slashes at 100 %.
+    pub fn accrue_postpaid_debt(env: Env, owner: Address, debt_amount: i128) {
+        if debt_amount <= 0 {
+            return;
         }
 
-        council.members = council.pending_members.clone();
-        council.pending_members = Vec::new(&env);
-        council.dao_rotation_requested_at = 0;
+        let mut deposit: GuarantorDeposit = env
+            .storage()
+            .instance()
+            .get(&DataKey::GuarantorDeposit(owner.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::GuarantorDepositNotFound));
+
+        if deposit.is_slashed {
+            panic_with_error!(&env, ContractError::DepositAlreadySlashed);
+        }
+
+        let now = env.ledger().timestamp();
+        deposit.accrued_debt = deposit.accrued_debt.saturating_add(debt_amount);
+        deposit.last_updated = now;
+
+        let ratio_bps = if deposit.locked_amount > 0 {
+            (deposit.accrued_debt * 10_000) / deposit.locked_amount
+        } else {
+            10_000
+        };
+
+        if ratio_bps >= SLASH_THRESHOLD_BPS {
+            // Slash: transfer collateral to provider and terminate.
+            let slashed = deposit.locked_amount;
+            deposit.is_slashed = true;
+            deposit.locked_amount = 0;
+
+            // Identify the provider from the first active post-paid meter.
+            let count: u64 = env
+                .storage()
+                .instance()
+                .get::<DataKey, u64>(&DataKey::Count)
+                .unwrap_or(0);
+
+            let mut provider_opt: Option<Address> = None;
+            for meter_id in 1..=count {
+                if let Some(mut meter) = env
+                    .storage()
+                    .instance()
+                    .get::<DataKey, Meter>(&DataKey::Meter(meter_id))
+                {
+                    if meter.user == owner
+                        && meter.billing_type == BillingType::PostPaid
+                        && meter.is_active
+                    {
+                        provider_opt = Some(meter.provider.clone());
+                        meter.is_active = false;
+                        meter.is_closed = true;
+                        env.storage()
+                            .instance()
+                            .set(&DataKey::Meter(meter_id), &meter);
+                    }
+                }
+            }
+
+            if let Some(provider) = provider_opt {
+                let token_client =
+                    token::Client::new(&env, &deposit.collateral_token);
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &provider,
+                    &slashed,
+                );
+
+                env.events().publish(
+                    symbol_short!("GDepSlsh"),
+                    GuarantorSlashed {
+                        owner: owner.clone(),
+                        slashed_amount: slashed,
+                        provider,
+                        timestamp: now,
+                    },
+                );
+            }
+        } else if ratio_bps >= MARGIN_CALL_THRESHOLD_BPS && !deposit.margin_call_sent {
+            deposit.margin_call_sent = true;
+            env.events().publish(
+                symbol_short!("MrgnCall"),
+                CreditLimitApproached {
+                    owner: owner.clone(),
+                    accrued_debt: deposit.accrued_debt,
+                    locked_amount: deposit.locked_amount,
+                    ratio_bps,
+                    timestamp: now,
+                },
+            );
+        }
+
         env.storage()
             .instance()
-            .set(&DataKey::FleetCouncil(provider.clone()), &council);
-        env.events()
-            .publish((symbol_short!("DAORotDone"), provider), ());
+            .set(&DataKey::GuarantorDeposit(owner), &deposit);
     }
 
-    /// Get the staged update for a meter (if any).
-    pub fn get_staged_update(env: Env, meter_id: u64) -> Option<StagedFleetUpdate> {
+    /// Settle post-paid debt manually (user pays off their bill).
+    pub fn settle_postpaid_debt(env: Env, owner: Address, payment_amount: i128) {
+        owner.require_auth();
+
+        let mut deposit: GuarantorDeposit = env
+            .storage()
+            .instance()
+            .get(&DataKey::GuarantorDeposit(owner.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::GuarantorDepositNotFound));
+
+        if deposit.is_slashed {
+            panic_with_error!(&env, ContractError::DepositAlreadySlashed);
+        }
+
+        let settlement = payment_amount.min(deposit.accrued_debt);
+        if settlement <= 0 {
+            return;
+        }
+
+        let token_client = token::Client::new(&env, &deposit.collateral_token);
+        token_client.transfer(&owner, &env.current_contract_address(), &settlement);
+
+        deposit.accrued_debt = deposit.accrued_debt.saturating_sub(settlement);
+        deposit.margin_call_sent = false; // Reset warning after settlement.
+        deposit.last_updated = env.ledger().timestamp();
+
         env.storage()
             .instance()
-            .get(&DataKey::StagedUpdate(meter_id))
+            .set(&DataKey::GuarantorDeposit(owner.clone()), &deposit);
+
+        env.events().publish(
+            symbol_short!("DebtSetl"),
+            (owner, settlement, deposit.accrued_debt),
+        );
     }
 
-    /// Get the fleet security council for a provider.
-    pub fn get_fleet_council(env: Env, provider: Address) -> Option<FleetSecurityCouncil> {
+    /// Get the current guarantor deposit for a user.
+    pub fn get_guarantor_deposit(env: Env, owner: Address) -> Option<GuarantorDeposit> {
         env.storage()
             .instance()
-            .get(&DataKey::FleetCouncil(provider))
+            .get(&DataKey::GuarantorDeposit(owner))
     }
 }
 

@@ -5,15 +5,18 @@ use soroban_sdk::{
     Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
-// Oracle client interface
-use soroban_sdk::contractclient;
-
 #[contractclient(name = "PriceOracleClient")]
 pub trait PriceOracle {
     fn xlm_to_usd_cents(env: Env, xlm_amount: i128) -> i128;
     fn usd_cents_to_xlm(env: Env, usd_cents: i128) -> i128;
     fn get_price(env: Env) -> PriceData;
     fn verify_green_source(env: Env, provider: Address, meter_id: u64, timestamp: u64) -> bool;
+}
+
+// Issue #252: Carbon-Credit Minter cross-contract interface
+#[contractclient(name = "CarbonCreditMinterClient")]
+pub trait CarbonCreditMinter {
+    fn mint_credits(env: Env, recipient: Address, amount: i128);
 }
 
 #[contracttype]

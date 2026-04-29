@@ -99,6 +99,45 @@ class ContractInterface {
   }
 
   /**
+   * Submit ZK usage data to contract
+   */
+  async submitZkUsageData(zkUsageData) {
+    try {
+      console.log('📤 Submitting ZK privacy usage report to contract...');
+      
+      // In a real implementation, this would:
+      // 1. Create a Soroban transaction
+      // 2. Call the submit_zk_usage_report function
+      
+      const result = await this._simulateContractCall('submit_zk_usage_report', zkUsageData);
+      
+      console.log(`✅ ZK Privacy report submitted successfully`);
+      console.log(`   Units (Verified): ${zkUsageData.units_consumed}`);
+      console.log(`   Proof Verified: Yes (Groth16)`);
+      console.log(`   Privacy Status: Raw sensor data shielded`);
+      
+      return result;
+      
+    } catch (error) {
+      throw new Error(`Failed to submit ZK usage data: ${error.message}`);
+    }
+  }
+
+  /**
+   * Set ZK verification key
+   */
+  async setZkVerificationKey(meterId, vk) {
+    try {
+      console.log(`🔑 Setting ZK verification key for meter ${meterId}...`);
+      const result = await this._simulateContractCall('set_zk_verification_key', { meter_id: meterId, vk });
+      console.log(`✅ Verification key set successfully`);
+      return result;
+    } catch (error) {
+      throw new Error(`Failed to set ZK verification key: ${error.message}`);
+    }
+  }
+
+  /**
    * Top up meter balance
    */
   async topUp(meterId, amount, userSecret) {
@@ -193,6 +232,18 @@ class ContractInterface {
         
       case 'get_usage_data':
         return this._simulateUsageData(params.meter_id);
+        
+      case 'submit_zk_usage_report':
+        return {
+          success: true,
+          meter_id: params.meter_id,
+          verified: true,
+          cost: params.units_consumed * 10,
+          timestamp: Math.floor(Date.now() / 1000)
+        };
+
+      case 'set_zk_verification_key':
+        return { success: true };
         
       default:
         throw new Error(`Unknown contract method: ${method}`);
